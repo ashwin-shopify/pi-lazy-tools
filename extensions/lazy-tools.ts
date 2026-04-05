@@ -367,8 +367,22 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 
 	// ── System Prompt Injection ───────────────────────────────────────────
 
+	let hasReconciled = false;
+
 	pi.on("before_agent_start", async (event) => {
 		if (!isEnabled) return;
+
+		// Safety net: re-apply filter once before the first API call.
+		// Catches tools registered after the watcher stabilized.
+		if (!hasReconciled) {
+			hasReconciled = true;
+			const allTools = pi.getAllTools();
+			const currentGroups = categorizeTools(allTools);
+			if (allTools.length !== toolGroups.reduce((s, g) => s + g.tools.length, 0)) {
+				toolGroups = currentGroups;
+				applyActiveTools();
+			}
+		}
 
 		const loadable = loadableGroups();
 		if (loadable.length === 0) return;
@@ -384,6 +398,8 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 	// ── Session Lifecycle ─────────────────────────────────────────────────
 
 	pi.on("session_start", async (event, ctx) => {
+		hasReconciled = false;
+
 		// Discover tool groups from everything that's registered
 		toolGroups = categorizeTools(pi.getAllTools());
 
@@ -427,19 +443,26 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 		}
 
 		if (config) {
+			const beforeCount = pi.getAllTools().length;
 			applyActiveTools();
+			const activeCount = pi.getActiveTools().length;
+			ctx.ui.notify(`lazy-tools: ${beforeCount} total, ${activeCount} active after filter`, "info");
 		}
 		updateStatus(ctx);
 
 		// Watch for async tool registrations (e.g. vault MCP discovery)
 		// and re-apply filters once the tool count stabilizes.
 		if (config) {
+			const watchInitialCount = pi.getAllTools().length;
 			watchForAsyncTools({
 				getToolCount: () => pi.getAllTools().length,
 				onStabilized: () => {
+					const newCount = pi.getAllTools().length;
 					toolGroups = categorizeTools(pi.getAllTools());
 					applyActiveTools();
+					const activeAfter = pi.getActiveTools().length;
 					updateStatus(ctx);
+					ctx.ui.notify(`lazy-tools watcher: ${watchInitialCount} → ${newCount} total, filtered to ${activeAfter} active`, "info");
 				},
 			});
 		}
