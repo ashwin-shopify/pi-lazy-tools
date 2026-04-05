@@ -19,9 +19,7 @@ This extension categorizes tools into groups and lets you choose which load imme
 ## Install
 
 ```bash
-pi install /path/to/lazy-load
-# or
-pi install git:github.com/you/pi-lazy-tools
+pi install git:github.com/ashwin-shopify/pi-lazy-tools
 ```
 
 ## Usage
