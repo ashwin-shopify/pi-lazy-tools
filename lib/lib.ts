@@ -175,6 +175,59 @@ export function loadGroups(
 	return { loaded, alreadyActive, notFound, disabled };
 }
 
+// ─── Async Tool Watch ────────────────────────────────────────────────────────
+
+export interface WatchForAsyncToolsOptions {
+	/** Returns the current tool count. */
+	getToolCount: () => number;
+	/** Called when new tools are detected and count has stabilized. */
+	onStabilized: () => void;
+	/** Max time to poll in ms. Default: 5000. */
+	maxWaitMs?: number;
+	/** Poll interval in ms. Default: 250. */
+	pollIntervalMs?: number;
+	/** Number of consecutive stable checks before triggering. Default: 3. */
+	stableThreshold?: number;
+}
+
+/**
+ * Polls for async tool registrations (e.g. vault MCP discovery) and calls
+ * onStabilized once the tool count changes and then holds steady.
+ * Returns a cleanup function to cancel the poll.
+ */
+export function watchForAsyncTools(opts: WatchForAsyncToolsOptions): () => void {
+	const maxWaitMs = opts.maxWaitMs ?? 5000;
+	const pollIntervalMs = opts.pollIntervalMs ?? 250;
+	const stableThreshold = opts.stableThreshold ?? 3;
+
+	const initialCount = opts.getToolCount();
+	let lastCount = initialCount;
+	let stableChecks = 0;
+	const startTime = Date.now();
+
+	const poll = setInterval(() => {
+		const currentCount = opts.getToolCount();
+		if (currentCount === lastCount) {
+			stableChecks++;
+		} else {
+			stableChecks = 0;
+			lastCount = currentCount;
+		}
+
+		const timedOut = Date.now() - startTime > maxWaitMs;
+		const stabilized = currentCount !== initialCount && stableChecks >= stableThreshold;
+
+		if (stabilized || timedOut) {
+			clearInterval(poll);
+			if (currentCount !== initialCount) {
+				opts.onStabilized();
+			}
+		}
+	}, pollIntervalMs);
+
+	return () => clearInterval(poll);
+}
+
 // ─── System Prompt Injection ─────────────────────────────────────────────────
 
 export function buildLazyGroupsPrompt(loadableGroups: ToolGroup[]): string {

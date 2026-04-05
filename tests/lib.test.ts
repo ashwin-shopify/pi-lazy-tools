@@ -14,6 +14,7 @@ import {
 	loadConfigFromPath,
 	saveConfigToPath,
 	buildDefaultConfig,
+	watchForAsyncTools,
 	type ToolLike,
 	type ToolGroup,
 	type LazyToolsConfig,
@@ -459,5 +460,136 @@ describe("buildDefaultConfig", () => {
 		const groups = categorizeTools(MOCK_TOOLS);
 		const config = buildDefaultConfig(groups);
 		assert.equal(config.version, 1);
+	});
+});
+
+// ─── watchForAsyncTools ─────────────────────────────────────────────────────
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+describe("watchForAsyncTools", () => {
+	it("calls onStabilized when tool count changes and stabilizes", async () => {
+		let toolCount = 10;
+		let stabilizedCalled = false;
+
+		watchForAsyncTools({
+			getToolCount: () => toolCount,
+			onStabilized: () => { stabilizedCalled = true; },
+			pollIntervalMs: 50,
+			stableThreshold: 2,
+			maxWaitMs: 5000,
+		});
+
+		// Simulate vault registering tools after 100ms
+		await sleep(80);
+		assert.equal(stabilizedCalled, false, "should not fire before tools change");
+		toolCount = 38;
+
+		// Wait for stabilization (2 checks × 50ms = 100ms after change detected)
+		await sleep(250);
+		assert.equal(stabilizedCalled, true, "should fire after count stabilizes");
+	});
+
+	it("does NOT call onStabilized if tool count never changes", async () => {
+		let stabilizedCalled = false;
+
+		watchForAsyncTools({
+			getToolCount: () => 10,
+			onStabilized: () => { stabilizedCalled = true; },
+			pollIntervalMs: 50,
+			stableThreshold: 2,
+			maxWaitMs: 200,
+		});
+
+		// Wait past the timeout
+		await sleep(350);
+		assert.equal(stabilizedCalled, false, "should not fire if count never changed");
+	});
+
+	it("handles tools arriving in waves (resets stability counter)", async () => {
+		let toolCount = 10;
+		let stabilizedCalled = false;
+
+		watchForAsyncTools({
+			getToolCount: () => toolCount,
+			onStabilized: () => { stabilizedCalled = true; },
+			pollIntervalMs: 50,
+			stableThreshold: 3,
+			maxWaitMs: 5000,
+		});
+
+		// First wave: vault registers 28 tools
+		await sleep(80);
+		toolCount = 38;
+
+		// Second wave before stabilization: observe registers 5 more
+		await sleep(80);
+		assert.equal(stabilizedCalled, false, "should not fire between waves");
+		toolCount = 43;
+
+		// Now let it stabilize (3 checks × 50ms = 150ms)
+		await sleep(300);
+		assert.equal(stabilizedCalled, true, "should fire after final wave stabilizes");
+	});
+
+	it("fires onStabilized on timeout if tools changed but never fully stabilized", async () => {
+		let toolCount = 10;
+		let stabilizedCalled = false;
+
+		watchForAsyncTools({
+			getToolCount: () => toolCount,
+			onStabilized: () => { stabilizedCalled = true; },
+			pollIntervalMs: 50,
+			stableThreshold: 100, // impossibly high
+			maxWaitMs: 200,
+		});
+
+		// Change count so it's different from initial
+		await sleep(60);
+		toolCount = 38;
+
+		// Wait for timeout
+		await sleep(300);
+		assert.equal(stabilizedCalled, true, "should fire on timeout since count changed");
+	});
+
+	it("returns a cleanup function that stops polling", async () => {
+		let toolCount = 10;
+		let stabilizedCalled = false;
+
+		const cancel = watchForAsyncTools({
+			getToolCount: () => toolCount,
+			onStabilized: () => { stabilizedCalled = true; },
+			pollIntervalMs: 50,
+			stableThreshold: 2,
+			maxWaitMs: 5000,
+		});
+
+		// Change count then immediately cancel
+		toolCount = 38;
+		cancel();
+
+		// Wait well past stabilization time
+		await sleep(300);
+		assert.equal(stabilizedCalled, false, "should not fire after cancel");
+	});
+
+	it("calls onStabilized exactly once", async () => {
+		let toolCount = 10;
+		let callCount = 0;
+
+		watchForAsyncTools({
+			getToolCount: () => toolCount,
+			onStabilized: () => { callCount++; },
+			pollIntervalMs: 50,
+			stableThreshold: 2,
+			maxWaitMs: 5000,
+		});
+
+		toolCount = 38;
+		await sleep(400);
+		assert.equal(callCount, 1, "should fire exactly once");
 	});
 });

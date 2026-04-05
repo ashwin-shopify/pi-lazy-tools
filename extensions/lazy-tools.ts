@@ -35,6 +35,7 @@ import {
 	saveConfigToPath,
 	buildDefaultConfig,
 	buildLazyGroupsPrompt,
+	watchForAsyncTools,
 } from "../lib/lib.js";
 
 function getConfigPath(): string {
@@ -429,6 +430,19 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 			applyActiveTools();
 		}
 		updateStatus(ctx);
+
+		// Watch for async tool registrations (e.g. vault MCP discovery)
+		// and re-apply filters once the tool count stabilizes.
+		if (config) {
+			watchForAsyncTools({
+				getToolCount: () => pi.getAllTools().length,
+				onStabilized: () => {
+					toolGroups = categorizeTools(pi.getAllTools());
+					applyActiveTools();
+					updateStatus(ctx);
+				},
+			});
+		}
 	});
 
 	// Restore on tree navigation
