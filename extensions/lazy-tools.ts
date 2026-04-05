@@ -17,118 +17,28 @@
  *   Ctrl+Shift+T  — Cycle through and toggle tool groups
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import type { ExtensionAPI, ExtensionContext, ToolInfo } from "@mariozechner/pi-coding-agent";
+import { join } from "node:path";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { DynamicBorder, getAgentDir, getSettingsListTheme } from "@mariozechner/pi-coding-agent";
 import { Container, Key, type SelectItem, SelectList, type SettingItem, SettingsList, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { StringEnum } from "@mariozechner/pi-ai";
-
-// ─── Types ───────────────────────────────────────────────────────────────────
-
-interface ToolGroup {
-	name: string;
-	displayName: string;
-	tools: string[];
-	description: string;
-}
-
-type GroupMode = "always" | "on-demand" | "off";
-
-interface LazyToolsConfig {
-	version: 1;
-	/** Map of group name → mode */
-	groups: Record<string, GroupMode>;
-}
-
-// ─── Tool Group Definitions ──────────────────────────────────────────────────
-
-/** Categorize tools into groups by prefix. Unknown tools go into "core". */
-function categorizeTools(allTools: ToolInfo[]): ToolGroup[] {
-	const prefixMap: Record<string, { displayName: string; description: string }> = {
-		observe: { displayName: "Observe", description: "Observability: logs, metrics, traces, error groups, dashboards" },
-		vault: { displayName: "Vault", description: "Shopify internal: people, teams, projects, missions, pages, issues" },
-		bk: { displayName: "Buildkite", description: "CI/CD: builds, jobs, pipelines, failure triage" },
-		slack: { displayName: "Slack", description: "Messaging: search, threads, channels, DMs, canvases" },
-		gcal: { displayName: "Google Calendar", description: "Calendar: events, availability, scheduling" },
-		gmail: { displayName: "Gmail", description: "Email: search, read, manage messages" },
-		gdoc: { displayName: "Google Docs", description: "Docs: create, write, edit documents" },
-		gdrive: { displayName: "Google Drive", description: "Drive: search files" },
-		gworkspace: { displayName: "Google Workspace", description: "Workspace: file metadata, read Drive files" },
-		grokt: { displayName: "Grokt", description: "Code search: regex search across all indexed repos" },
-		data_portal: { displayName: "Data Portal", description: "BigQuery: search tables, run SQL, create dashboards" },
-		memory: { displayName: "Memory", description: "Persistent memory bank: read, write, search knowledge" },
-		superpowers: { displayName: "Superpowers", description: "Skills and subagent dispatch" },
-	};
-
-	const groups = new Map<string, string[]>();
-	const coreTools: string[] = [];
-
-	for (const tool of allTools) {
-		let matched = false;
-		for (const prefix of Object.keys(prefixMap)) {
-			if (tool.name.startsWith(prefix + "_") || tool.name.startsWith(prefix + ".") || tool.name === prefix) {
-				const existing = groups.get(prefix) ?? [];
-				existing.push(tool.name);
-				groups.set(prefix, existing);
-				matched = true;
-				break;
-			}
-		}
-		if (!matched) {
-			coreTools.push(tool.name);
-		}
-	}
-
-	const result: ToolGroup[] = [];
-
-	// Core always first
-	if (coreTools.length > 0) {
-		result.push({
-			name: "core",
-			displayName: "Core",
-			tools: coreTools,
-			description: "Essential tools: read, write, edit, bash, ask, set_session_label, etc.",
-		});
-	}
-
-	// Then discovered groups, sorted by tool count descending
-	const sortedPrefixes = [...groups.entries()].sort((a, b) => b[1].length - a[1].length);
-	for (const [prefix, tools] of sortedPrefixes) {
-		const meta = prefixMap[prefix]!;
-		result.push({
-			name: prefix,
-			displayName: meta.displayName,
-			tools,
-			description: meta.description,
-		});
-	}
-
-	return result;
-}
-
-// ─── Config Persistence ──────────────────────────────────────────────────────
+import {
+	type GroupMode,
+	type LazyToolsConfig,
+	type ToolGroup,
+	categorizeTools,
+	computeActiveTools,
+	getGroupMode,
+	getLoadableGroups,
+	loadGroups,
+	loadConfigFromPath,
+	saveConfigToPath,
+	buildDefaultConfig,
+	buildLazyGroupsPrompt,
+} from "./lib.js";
 
 function getConfigPath(): string {
 	return join(getAgentDir(), "lazy-tools.json");
-}
-
-function loadConfig(): LazyToolsConfig | null {
-	const path = getConfigPath();
-	if (!existsSync(path)) return null;
-	try {
-		const content = readFileSync(path, "utf-8");
-		return JSON.parse(content) as LazyToolsConfig;
-	} catch {
-		return null;
-	}
-}
-
-function saveConfig(config: LazyToolsConfig): void {
-	const path = getConfigPath();
-	mkdirSync(dirname(path), { recursive: true });
-	writeFileSync(path, JSON.stringify(config, null, 2), "utf-8");
 }
 
 // ─── Extension ───────────────────────────────────────────────────────────────
@@ -142,51 +52,23 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 
 	// ── Helpers ────────────────────────────────────────────────────────────
 
-	function getGroupMode(groupName: string): GroupMode {
-		if (!config) return "always";
-		// Core is always "always"
-		if (groupName === "core") return "always";
-		return config.groups[groupName] ?? "on-demand";
-	}
-
-	function getActiveToolNames(): string[] {
-		const tools: string[] = [];
-		for (const group of toolGroups) {
-			const mode = getGroupMode(group.name);
-			if (mode === "always" || sessionActivated.has(group.name)) {
-				tools.push(...group.tools);
-			}
-		}
-		// Always include the load_tools gateway
-		if (!tools.includes("load_tools")) {
-			tools.push("load_tools");
-		}
-		return tools;
+	function activeToolNames(): string[] {
+		return computeActiveTools(toolGroups, config, sessionActivated);
 	}
 
 	function applyActiveTools(): void {
 		if (!isEnabled) return;
-		pi.setActiveTools(getActiveToolNames());
+		pi.setActiveTools(activeToolNames());
 	}
 
-	function getLoadableGroups(): ToolGroup[] {
-		return toolGroups.filter((g) => {
-			const mode = getGroupMode(g.name);
-			return mode === "on-demand" && !sessionActivated.has(g.name);
-		});
-	}
-
-	function formatGroupLabel(group: ToolGroup): string {
-		const mode = getGroupMode(group.name);
-		const loaded = sessionActivated.has(group.name);
-		const suffix = mode === "on-demand" && loaded ? " (loaded)" : "";
-		return `${group.displayName} (${group.tools.length} tools)${suffix}`;
+	function loadableGroups(): ToolGroup[] {
+		return getLoadableGroups(toolGroups, config, sessionActivated);
 	}
 
 	function updateStatus(ctx: ExtensionContext): void {
-		const activeCount = getActiveToolNames().length - 1; // Subtract load_tools
+		const activeCount = activeToolNames().length - 1; // Subtract load_tools
 		const totalCount = toolGroups.reduce((sum, g) => sum + g.tools.length, 0);
-		const onDemandGroups = getLoadableGroups();
+		const onDemandGroups = loadableGroups();
 
 		if (!isEnabled || activeCount === totalCount) {
 			ctx.ui.setStatus("lazy-tools", undefined);
@@ -223,29 +105,9 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 			groups: Type.Array(Type.String({ description: "Group names to load (e.g. 'observe', 'vault', 'slack')" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const loaded: string[] = [];
-			const alreadyActive: string[] = [];
-			const notFound: string[] = [];
-			const disabled: string[] = [];
-
-			for (const name of params.groups) {
-				const group = toolGroups.find((g) => g.name === name);
-				if (!group) {
-					notFound.push(name);
-					continue;
-				}
-				const mode = getGroupMode(name);
-				if (mode === "off") {
-					disabled.push(name);
-					continue;
-				}
-				if (mode === "always" || sessionActivated.has(name)) {
-					alreadyActive.push(name);
-					continue;
-				}
-				sessionActivated.add(name);
-				loaded.push(name);
-			}
+			const { loaded, alreadyActive, notFound, disabled } = loadGroups(
+				params.groups, toolGroups, config, sessionActivated,
+			);
 
 			applyActiveTools();
 			updateStatus(ctx);
@@ -272,15 +134,25 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 		},
 
 		renderResult(result, _options, theme) {
-			const details = result.details as { loaded: string[]; alreadyActive: string[] };
-			const lines: string[] = [];
-			if (details?.loaded?.length > 0) {
-				lines.push(theme.fg("success", `✓ Loaded: ${details.loaded.join(", ")}`));
+			const details = result.details as { loaded: string[]; alreadyActive: string[]; notFound: string[]; disabled: string[] } | undefined;
+			if (!details) {
+				const text = result.content[0];
+				return new Text(text?.type === "text" ? text.text : "", 0, 0);
 			}
-			if (details?.alreadyActive?.length > 0) {
-				lines.push(theme.fg("muted", `Already active: ${details.alreadyActive.join(", ")}`));
+			const parts: string[] = [];
+			if (details.loaded?.length > 0) {
+				parts.push(theme.fg("success", `✓ Loaded: ${details.loaded.join(", ")}`));
 			}
-			return lines.length > 0 ? lines : undefined;
+			if (details.alreadyActive?.length > 0) {
+				parts.push(theme.fg("muted", `Already active: ${details.alreadyActive.join(", ")}`));
+			}
+			if (details.notFound?.length > 0) {
+				parts.push(theme.fg("warning", `Not found: ${details.notFound.join(", ")}`));
+			}
+			if (details.disabled?.length > 0) {
+				parts.push(theme.fg("warning", `Disabled: ${details.disabled.join(", ")}`));
+			}
+			return new Text(parts.join("\n") || "No changes", 0, 0);
 		},
 	});
 
@@ -299,7 +171,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 
 		// Initialize from current config
 		for (const group of toolGroups) {
-			newConfig[group.name] = getGroupMode(group.name);
+			newConfig[group.name] = getGroupMode(config, group.name);
 		}
 
 		const result = await ctx.ui.custom<boolean>((_tui, theme, _kb, done) => {
@@ -334,7 +206,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 				() => {
 					// Save on close
 					config = { version: 1, groups: newConfig };
-					saveConfig(config);
+					saveConfigToPath(getConfigPath(), config);
 					done(true);
 				},
 				{ enableSearch: true },
@@ -369,7 +241,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 	// ── Quick Load Command ────────────────────────────────────────────────
 
 	async function showQuickLoader(ctx: ExtensionContext): Promise<void> {
-		const loadable = getLoadableGroups();
+		const loadable = loadableGroups();
 		if (loadable.length === 0) {
 			ctx.ui.notify("All tool groups are already active", "info");
 			return;
@@ -456,7 +328,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 			await showQuickLoader(ctx);
 		},
 		completer: (prefix) => {
-			const loadable = getLoadableGroups();
+			const loadable = loadableGroups();
 			const items = loadable.map((g) => ({ value: g.name, label: g.name }));
 			const filtered = items.filter((i) => i.value.startsWith(prefix));
 			return filtered.length > 0 ? filtered : null;
@@ -468,7 +340,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			const lines: string[] = [];
 			for (const group of toolGroups) {
-				const mode = getGroupMode(group.name);
+				const mode = getGroupMode(config, group.name);
 				const loaded = sessionActivated.has(group.name);
 				const icon = mode === "always" || loaded ? "●" : mode === "on-demand" ? "○" : "✕";
 				const status = mode === "always"
@@ -497,21 +369,11 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event) => {
 		if (!isEnabled) return;
 
-		const loadable = getLoadableGroups();
+		const loadable = loadableGroups();
 		if (loadable.length === 0) return;
 
-		const groupList = loadable
-			.map((g) => `- ${g.name}: ${g.description} (${g.tools.length} tools)`)
-			.join("\n");
-
-		const injection = `
-## Lazy-loadable tool groups
-
-The following tool groups are available but NOT currently loaded. Call load_tools(groups: ["<name>"]) to activate them before using any of their tools.
-
-${groupList}
-
-Do NOT hallucinate tools from inactive groups. Call load_tools first.`;
+		const injection = buildLazyGroupsPrompt(loadable);
+		if (!injection) return;
 
 		return {
 			systemPrompt: event.systemPrompt + injection,
@@ -533,7 +395,7 @@ Do NOT hallucinate tools from inactive groups. Call load_tools first.`;
 		}
 
 		// Load config
-		config = loadConfig();
+		config = loadConfigFromPath(getConfigPath());
 
 		// Restore session-activated groups from branch
 		const entries = ctx.sessionManager.getBranch();
@@ -557,13 +419,8 @@ Do NOT hallucinate tools from inactive groups. Call load_tools first.`;
 			if (proceed) {
 				await runSetupWizard(ctx);
 			} else {
-				// Default: core + memory always, everything else on-demand
-				const defaultGroups: Record<string, GroupMode> = {};
-				for (const group of toolGroups) {
-					defaultGroups[group.name] = group.name === "core" || group.name === "memory" ? "always" : "on-demand";
-				}
-				config = { version: 1, groups: defaultGroups };
-				saveConfig(config);
+				config = buildDefaultConfig(toolGroups);
+				saveConfigToPath(getConfigPath(), config);
 				ctx.ui.notify("Default config saved: core always-on, everything else on-demand. Use /tools-setup to change.", "info");
 			}
 		}

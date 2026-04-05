@@ -1,12 +1,10 @@
 # ⚡ pi-lazy-tools
 
-Reduce context window usage by **lazy-loading tool groups on demand** instead of shoving all 100+ tools into every prompt.
+Lazy-load tool groups on demand in [pi](https://github.com/badlogic/pi) to save context window tokens.
 
-## The Problem
+## Why
 
-Pi loads ~109 tools into the system prompt at session start, consuming ~15% of a 250k context window before you even type a message. Most sessions only use a fraction of these tools.
-
-## The Solution
+When you install many pi extensions (Observe, Vault, Slack, Buildkite, etc.), each one registers tools that are included in every system prompt. If you have 80-100+ tools, this can use a meaningful chunk of your context window before you type anything.
 
 This extension categorizes tools into groups and lets you choose which load immediately vs on-demand:
 
@@ -62,20 +60,20 @@ pi --lazy false
 
 Groups are auto-detected by tool name prefix:
 
-| Group | Tools | Description |
-|-------|-------|-------------|
-| core | ~8 | read, write, edit, bash, ask, etc. (always on) |
-| observe | ~21 | Logs, metrics, traces, error groups |
-| vault | ~30 | People, teams, projects, missions, pages |
-| buildkite | ~9 | CI/CD builds, jobs, pipelines |
-| slack | ~8 | Search, threads, channels, DMs |
-| data_portal | ~6 | BigQuery queries, dashboards |
-| gcal | ~4 | Calendar events, availability |
-| grokt | ~4 | Code search across repos |
-| gdoc | ~3 | Google Docs create/edit |
-| gmail | ~2 | Email read/manage |
-| memory | ~5 | Persistent memory bank |
-| superpowers | ~2 | Skills and subagent dispatch |
+| Group | Description |
+|-------|-------------|
+| core | read, write, edit, bash, ask, etc. (always on) |
+| observe | Logs, metrics, traces, error groups |
+| vault | People, teams, projects, missions, pages |
+| bk | CI/CD builds, jobs, pipelines |
+| slack | Search, threads, channels, DMs |
+| data_portal | BigQuery queries, dashboards |
+| gcal | Calendar events, availability |
+| grokt | Code search across repos |
+| memory | Persistent memory bank |
+| superpowers | Skills and subagent dispatch |
+
+Actual groups and tool counts depend on what extensions you have installed.
 
 ## Config
 
@@ -95,10 +93,9 @@ Saved to `~/.pi/agent/lazy-tools.json`:
 }
 ```
 
-## Typical Context Savings
+## Development
 
-| Scenario | Before | After |
-|----------|--------|-------|
-| Session start | ~39k tokens (15.6%) | ~8-12k tokens (~4%) |
-| After loading 2 groups | — | ~18-22k tokens (~8%) |
-| Full session (all loaded) | ~39k tokens | ~39k tokens + gateway overhead |
+```bash
+pnpm install
+pnpm test
+```
