@@ -35,7 +35,7 @@ import {
 	saveConfigToPath,
 	buildDefaultConfig,
 	buildLazyGroupsPrompt,
-} from "./lib.js";
+} from "../lib/lib.js";
 
 function getConfigPath(): string {
 	return join(getAgentDir(), "lazy-tools.json");

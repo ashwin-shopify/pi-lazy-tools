@@ -18,7 +18,7 @@ import {
 	type ToolGroup,
 	type LazyToolsConfig,
 	type GroupMode,
-} from "../extensions/lib.js";
+} from "../lib/lib.js";
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 
