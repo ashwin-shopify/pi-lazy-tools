@@ -1,0 +1,14 @@
+{
+  "name": "pi-lazy-tools",
+  "version": "0.1.0",
+  "description": "Lazy-load tool groups in pi to save context window tokens",
+  "keywords": ["pi-package"],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  },
+  "pi": {
+    "extensions": ["extensions"]
+  }
+}
