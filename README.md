@@ -26,6 +26,9 @@ pi install git:github.com/ashwin-shopify/pi-lazy-tools
 
 On first session start, the extension prompts you to configure tool groups. Or accept the default (core always-on, everything else on-demand).
 
+<img width="465" height="430" alt="image" src="https://github.com/user-attachments/assets/14e444a0-7c09-49e7-b658-e19d0160e257" />
+
+
 ### Commands
 
 | Command | Description |
