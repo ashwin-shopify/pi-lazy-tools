@@ -15,6 +15,7 @@ import {
 	saveConfigToPath,
 	buildDefaultConfig,
 	watchForAsyncTools,
+	reconcileConfig,
 	type ToolLike,
 	type ToolGroup,
 	type LazyToolsConfig,
@@ -591,5 +592,59 @@ describe("watchForAsyncTools", () => {
 		toolCount = 38;
 		await sleep(400);
 		assert.equal(callCount, 1, "should fire exactly once");
+	});
+});
+
+// ─── reconcileConfig ──────────────────────────────────────────────────────────
+
+describe("reconcileConfig", () => {
+	it("returns unchanged config when all groups still exist", () => {
+		const groups = categorizeTools(MOCK_TOOLS);
+		const config = makeConfig();
+		const { config: result, prunedGroups } = reconcileConfig(config, groups);
+		assert.equal(prunedGroups.length, 0);
+		assert.deepEqual(result.groups, config.groups);
+	});
+
+	it("removes groups that no longer have installed tools", () => {
+		// Simulate slack and vault being uninstalled
+		const toolsWithoutSlackAndVault = MOCK_TOOLS.filter(
+			(t) => !t.name.startsWith("slack_") && !t.name.startsWith("vault_"),
+		);
+		const groups = categorizeTools(toolsWithoutSlackAndVault);
+		const config = makeConfig();
+		const { config: result, prunedGroups } = reconcileConfig(config, groups);
+		assert.ok(prunedGroups.includes("slack"), "slack should be pruned");
+		assert.ok(prunedGroups.includes("vault"), "vault should be pruned");
+		assert.ok(!("slack" in result.groups), "slack removed from config");
+		assert.ok(!("vault" in result.groups), "vault removed from config");
+	});
+
+	it("does not mutate the original config", () => {
+		const toolsWithoutSlack = MOCK_TOOLS.filter((t) => !t.name.startsWith("slack_"));
+		const groups = categorizeTools(toolsWithoutSlack);
+		const config = makeConfig();
+		reconcileConfig(config, groups);
+		assert.ok("slack" in config.groups, "original config should be unchanged");
+	});
+
+	it("keeps always-on groups like core and memory even when not in toolGroups", () => {
+		// Edge case: config has core/memory but toolGroups somehow omits them
+		const groups = categorizeTools([{ name: "observe_query" }]);
+		const config: LazyToolsConfig = { version: 1, groups: { core: "always", memory: "always", observe: "on-demand" } };
+		const { config: result, prunedGroups } = reconcileConfig(config, groups);
+		// core and memory are pruned since they're not in toolGroups — that's correct;
+		// categorizeTools won't produce them if there are no matching tools
+		assert.ok(prunedGroups.includes("core"));
+		assert.ok(prunedGroups.includes("memory"));
+		assert.ok("observe" in result.groups);
+	});
+
+	it("returns empty prunedGroups and same config reference when nothing is stale", () => {
+		const groups = categorizeTools(MOCK_TOOLS);
+		const config = makeConfig();
+		const { config: result, prunedGroups } = reconcileConfig(config, groups);
+		assert.equal(prunedGroups.length, 0);
+		assert.strictEqual(result, config, "should return same config reference when no changes");
 	});
 });

@@ -263,6 +263,36 @@ export function saveConfigToPath(path: string, config: LazyToolsConfig): void {
 	writeFileSync(path, JSON.stringify(config, null, 2), "utf-8");
 }
 
+// ─── Config Reconciliation ──────────────────────────────────────────────────
+
+export interface ReconcileResult {
+	config: LazyToolsConfig;
+	/** Group names that were removed because they no longer have installed tools. */
+	prunedGroups: string[];
+}
+
+/**
+ * Remove stale group entries from a saved config.
+ * A group is stale when it appears in config.groups but has no corresponding
+ * entry in the currently discovered toolGroups (i.e. the package was uninstalled).
+ */
+export function reconcileConfig(
+	config: LazyToolsConfig,
+	toolGroups: ToolGroup[],
+): ReconcileResult {
+	const validGroupNames = new Set(toolGroups.map((g) => g.name));
+	const prunedGroups = Object.keys(config.groups).filter((k) => !validGroupNames.has(k));
+
+	if (prunedGroups.length === 0) return { config, prunedGroups: [] };
+
+	const groups = { ...config.groups };
+	for (const key of prunedGroups) {
+		delete groups[key];
+	}
+
+	return { config: { ...config, groups }, prunedGroups };
+}
+
 // ─── Default Config ──────────────────────────────────────────────────────────
 
 export function buildDefaultConfig(toolGroups: ToolGroup[]): LazyToolsConfig {

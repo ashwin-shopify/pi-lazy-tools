@@ -36,6 +36,7 @@ import {
 	buildDefaultConfig,
 	buildLazyGroupsPrompt,
 	watchForAsyncTools,
+	reconcileConfig,
 } from "../lib/lib.js";
 
 function getConfigPath(): string {
@@ -413,6 +414,16 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 
 		// Load config
 		config = loadConfigFromPath(getConfigPath());
+
+		// Remove stale groups from config (packages removed since last run)
+		if (config) {
+			const { config: reconciled, prunedGroups } = reconcileConfig(config, toolGroups);
+			if (prunedGroups.length > 0) {
+				config = reconciled;
+				saveConfigToPath(getConfigPath(), config);
+				ctx.ui.notify(`lazy-tools: removed stale groups from config: ${prunedGroups.join(", ")}`, "info");
+			}
+		}
 
 		// Restore session-activated groups from branch
 		const entries = ctx.sessionManager.getBranch();
