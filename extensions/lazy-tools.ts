@@ -97,7 +97,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 		description:
 			"Load a tool group on demand. Call this before using tools from an inactive group. " +
 			"Available groups are listed in the system prompt under 'Lazy-loadable tool groups'.",
-		promptSnippet: "Load a tool group on demand (observe, vault, slack, etc.) to access its tools",
+		promptSnippet: "Load a tool group on demand. Available groups are listed in the system prompt under 'Lazy-loadable tool groups'.",
 		promptGuidelines: [
 			"Before using a tool that isn't active, call load_tools to activate its group.",
 			"Check the 'Lazy-loadable tool groups' section in the system prompt to see which groups are available.",
