@@ -102,6 +102,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 			"Before using a tool that isn't active, call load_tools to activate its group.",
 			"Check the 'Lazy-loadable tool groups' section in the system prompt to see which groups are available.",
 			"You can load multiple groups at once by passing an array of group names.",
+			"After calling load_tools, the loaded tools become available on your NEXT response. Do not call loaded tools in the same response as the load_tools call — call load_tools first, then use the tools in your follow-up.",
 		],
 		parameters: Type.Object({
 			groups: Type.Array(Type.String({ description: "Group names to load (e.g. 'observe', 'vault', 'slack')" })),
@@ -121,6 +122,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 					return `${group.displayName} (${group.tools.length} tools: ${group.tools.join(", ")})`;
 				});
 				parts.push(`Loaded: ${details.join("; ")}`);
+				parts.push("These tools are now available. Proceed to use them.");
 			}
 			if (alreadyActive.length > 0) parts.push(`Already active: ${alreadyActive.join(", ")}`);
 			if (notFound.length > 0) parts.push(`Not found: ${notFound.join(", ")}`);
@@ -381,9 +383,13 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 			const currentGroups = categorizeTools(allTools);
 			if (allTools.length !== toolGroups.reduce((s, g) => s + g.tools.length, 0)) {
 				toolGroups = currentGroups;
-				applyActiveTools();
 			}
 		}
+
+		// Always re-apply active tools before each agent loop.
+		// This ensures tools loaded via load_tools in a previous loop
+		// are included in the context snapshot for the new loop.
+		applyActiveTools();
 
 		const loadable = loadableGroups();
 		if (loadable.length === 0) return;
