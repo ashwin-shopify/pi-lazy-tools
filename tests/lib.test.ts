@@ -16,6 +16,12 @@ import {
 	buildDefaultConfig,
 	watchForAsyncTools,
 	reconcileConfig,
+	detectGroupsFromPrompt,
+	computeToolHash,
+	buildCategorizationPrompt,
+	parseCategorizationResponse,
+	mergeGroupsIntoConfig,
+	GroupIndex,
 	type ToolLike,
 	type ToolGroup,
 	type LazyToolsConfig,
@@ -49,10 +55,16 @@ const MOCK_TOOLS: ToolLike[] = [
 	// Memory
 	{ name: "memory_read" },
 	{ name: "memory_search" },
-	// Single-tool groups
+	// Gcal (2 tools → forms a group)
 	{ name: "gcal_events" },
+	{ name: "gcal_list" },
+	// Gmail (2 tools → forms a group)
 	{ name: "gmail_read" },
+	{ name: "gmail_send" },
+	// Grokt (2 tools → forms a group)
 	{ name: "grokt_search" },
+	{ name: "grokt_index" },
+	// Single-tool prefix (goes to core with dynamic detection)
 	{ name: "data_portal_query_bigquery" },
 ];
 
@@ -69,7 +81,6 @@ function makeConfig(overrides: Record<string, GroupMode> = {}): LazyToolsConfig 
 			gcal: "on-demand",
 			gmail: "off",
 			grokt: "on-demand",
-			data_portal: "on-demand",
 			...overrides,
 		},
 	};
@@ -109,7 +120,7 @@ describe("categorizeTools", () => {
 		const groups = categorizeTools(MOCK_TOOLS);
 		const bk = groups.find((g) => g.name === "bk")!;
 		assert.deepEqual(bk.tools, ["bk_build_info", "bk_failed_jobs"]);
-		assert.equal(bk.displayName, "Buildkite");
+		assert.equal(bk.displayName, "Bk");
 	});
 
 	it("sorts non-core groups by tool count descending", () => {
@@ -129,17 +140,17 @@ describe("categorizeTools", () => {
 	});
 
 	it("handles tools with only recognized prefixes (no core group)", () => {
-		const groups = categorizeTools([{ name: "vault_get_user" }, { name: "slack_search" }]);
+		const groups = categorizeTools([{ name: "vault_get_user" }, { name: "vault_search" }, { name: "slack_search" }, { name: "slack_post" }]);
 		assert.ok(!groups.find((g) => g.name === "core"));
 		assert.equal(groups.length, 2);
 	});
 
 	it("matches exact prefix name as a tool", () => {
-		// Edge case: a tool named exactly "observe" (no underscore suffix)
+		// Edge case: a tool named exactly "observe" (no underscore suffix) — goes to core since no prefix separator
 		const groups = categorizeTools([{ name: "observe" }]);
-		const obs = groups.find((g) => g.name === "observe")!;
-		assert.ok(obs);
-		assert.deepEqual(obs.tools, ["observe"]);
+		const core = groups.find((g) => g.name === "core")!;
+		assert.ok(core);
+		assert.ok(core.tools.includes("observe"));
 	});
 
 	it("does not match partial prefixes", () => {
@@ -439,12 +450,12 @@ describe("config persistence", () => {
 // ─── buildDefaultConfig ─────────────────────────────────────────────────────
 
 describe("buildDefaultConfig", () => {
-	it("sets core and memory to always", () => {
+	it("defaults all groups to on-demand", () => {
 		const groups = categorizeTools(MOCK_TOOLS);
 		const config = buildDefaultConfig(groups);
 
-		assert.equal(config.groups.core, "always");
-		assert.equal(config.groups.memory, "always");
+		assert.equal(config.groups.core, "on-demand");
+		assert.equal(config.groups.memory, "on-demand");
 	});
 
 	it("sets everything else to on-demand", () => {
@@ -630,7 +641,7 @@ describe("reconcileConfig", () => {
 
 	it("keeps always-on groups like core and memory even when not in toolGroups", () => {
 		// Edge case: config has core/memory but toolGroups somehow omits them
-		const groups = categorizeTools([{ name: "observe_query" }]);
+		const groups = categorizeTools([{ name: "observe_query" }, { name: "observe_metrics" }]);
 		const config: LazyToolsConfig = { version: 1, groups: { core: "always", memory: "always", observe: "on-demand" } };
 		const { config: result, prunedGroups } = reconcileConfig(config, groups);
 		// core and memory are pruned since they're not in toolGroups — that's correct;
@@ -646,5 +657,224 @@ describe("reconcileConfig", () => {
 		const { config: result, prunedGroups } = reconcileConfig(config, groups);
 		assert.equal(prunedGroups.length, 0);
 		assert.strictEqual(result, config, "should return same config reference when no changes");
+	});
+});
+
+// ─── Dynamic categorization ─────────────────────────────────────────────────────
+
+describe("dynamic categorization", () => {
+	it("detects unknown prefix groups automatically", () => {
+		const tools: ToolLike[] = [
+			{ name: "read" },
+			{ name: "keke_pokie_search" },
+			{ name: "keke_pokie_delete" },
+			{ name: "keke_pokie_list" },
+		];
+		const groups = categorizeTools(tools);
+		const keke = groups.find((g) => g.name === "keke")!;
+		assert.ok(keke, "should detect keke group from shared prefix");
+		assert.equal(keke.tools.length, 3);
+		assert.equal(keke.displayName, "Keke");
+	});
+
+	it("puts single-prefix tools in core", () => {
+		const tools: ToolLike[] = [
+			{ name: "read" },
+			{ name: "lonely_tool" },
+		];
+		const groups = categorizeTools(tools);
+		const core = groups.find((g) => g.name === "core")!;
+		assert.ok(core.tools.includes("lonely_tool"));
+		assert.ok(!groups.find((g) => g.name === "lonely"));
+	});
+
+	it("auto-generates displayName from prefix", () => {
+		const tools: ToolLike[] = [
+			{ name: "foo_bar_one" },
+			{ name: "foo_bar_two" },
+		];
+		const groups = categorizeTools(tools);
+		const foo = groups.find((g) => g.name === "foo")!;
+		assert.equal(foo.displayName, "Foo");
+	});
+});
+
+// ─── detectGroupsFromPrompt ───────────────────────────────────────────────────
+
+describe("detectGroupsFromPrompt", () => {
+	const groups: ToolGroup[] = [
+		{ name: "gcal", displayName: "Google Calendar", description: "Calendar: events, availability, scheduling", tools: ["gcal_events", "gcal_list"] },
+		{ name: "gdocs", displayName: "Google Docs", description: "Document editing tools", tools: ["gdocs_create", "gdocs_get_structure"] },
+		{ name: "gsheets", displayName: "Google Sheets", description: "Spreadsheet tools", tools: ["gsheets_read", "gsheets_write"] },
+		{ name: "slack", displayName: "Slack", description: "Messaging: search, threads, channels", tools: ["slack_search", "slack_post"] },
+		{ name: "keke", displayName: "Keke", description: "Keke: search, delete, list", tools: ["keke_search", "keke_delete"] },
+	];
+
+	it("matches group name", () => {
+		const result = detectGroupsFromPrompt("load gcal tools", groups);
+		assert.ok(result.includes("gcal"));
+	});
+
+	it("matches display name case-insensitively", () => {
+		const result = detectGroupsFromPrompt("Check my Google Calendar", groups);
+		assert.ok(result.includes("gcal"));
+	});
+
+	it("matches on group name substring in prompt", () => {
+		const result = detectGroupsFromPrompt("search slack threads", groups);
+		assert.ok(result.includes("slack"));
+	});
+
+	it("does NOT match on generic tool suffixes like 'availability'", () => {
+		// This was causing false positives — "availability" matched gcal_availability
+		const result = detectGroupsFromPrompt("I need to check my availability", groups);
+		assert.ok(!result.includes("gcal"), "should not match on tool name suffix");
+	});
+
+	it("matches calendar-related words from display name", () => {
+		const result = detectGroupsFromPrompt("what's on my calendar today?", groups);
+		assert.ok(result.includes("gcal"));
+	});
+
+	it("returns empty for unrelated prompt", () => {
+		const result = detectGroupsFromPrompt("fix the typo in main.ts", groups);
+		assert.equal(result.length, 0);
+	});
+
+	it("matches dynamically created groups", () => {
+		const result = detectGroupsFromPrompt("use keke to search", groups);
+		assert.ok(result.includes("keke"));
+	});
+
+	it("does NOT match on generic description words", () => {
+		// "search" appears in many group descriptions — should not trigger
+		const result = detectGroupsFromPrompt("search for files", groups);
+		assert.equal(result.length, 0, "generic word 'search' should not match any group");
+	});
+
+
+
+
+
+});
+
+// ─── GroupIndex (pre-computed inverted index) ────────────────────────────────
+
+describe("GroupIndex", () => {
+	const groups: ToolGroup[] = [
+		{ name: "gcal", displayName: "Google Calendar", description: "Calendar tools", tools: ["gcal_events", "gcal_list"] },
+		{ name: "gdocs", displayName: "Google Docs", description: "Document tools", tools: ["gdocs_create"] },
+		{ name: "slack", displayName: "Slack", description: "Messaging tools", tools: ["slack_search"] },
+	];
+	const index = new GroupIndex(groups);
+
+	it("detects by group name", () => {
+		assert.ok(index.detect("load gcal").includes("gcal"));
+	});
+
+	it("detects by display name word", () => {
+		assert.ok(index.detect("what\'s on my calendar?").includes("gcal"));
+	});
+
+	it("detects by full display name phrase", () => {
+		assert.ok(index.detect("open google calendar").includes("gcal"));
+	});
+
+	it("hasUrl detects URLs in prompt", () => {
+		assert.ok(GroupIndex.hasUrl("read https://docs.google.com/document/d/123"));
+		assert.ok(GroupIndex.hasUrl("check http://example.com"));
+		assert.ok(!GroupIndex.hasUrl("fix the typo in main.ts"));
+		assert.ok(!GroupIndex.hasUrl("no urls here"));
+	});
+
+	it("respects loadable filter", () => {
+		const loadable = new Set(["slack"]);
+		const result = index.detect("check my calendar and slack", loadable);
+		assert.ok(!result.includes("gcal"), "gcal not loadable");
+		assert.ok(result.includes("slack"), "slack is loadable");
+	});
+
+	it("returns empty for unrelated prompt", () => {
+		assert.equal(index.detect("fix the typo in main.ts").length, 0);
+	});
+
+	it("is fast for repeated detections", () => {
+		const start = performance.now();
+		for (let i = 0; i < 1000; i++) {
+			index.detect("can you check my calendar and summarize that google doc?");
+		}
+		const elapsed = performance.now() - start;
+		assert.ok(elapsed < 50, `1000 detections took ${elapsed.toFixed(1)}ms, expected <50ms`);
+	});
+});
+
+// ─── LLM categorization helpers ───────────────────────────────────────────────
+
+describe("LLM categorization helpers", () => {
+	it("computeToolHash is stable for same tools", () => {
+		const tools: ToolLike[] = [{ name: "b" }, { name: "a" }];
+		const hash1 = computeToolHash(tools);
+		const hash2 = computeToolHash([{ name: "a" }, { name: "b" }]);
+		assert.equal(hash1, hash2, "hash should be order-independent");
+	});
+
+	it("computeToolHash changes when tools change", () => {
+		const hash1 = computeToolHash([{ name: "a" }]);
+		const hash2 = computeToolHash([{ name: "a" }, { name: "b" }]);
+		assert.notEqual(hash1, hash2);
+	});
+
+	it("buildCategorizationPrompt includes tool names", () => {
+		const prompt = buildCategorizationPrompt([{ name: "vault_search" }, { name: "read" }]);
+		assert.ok(prompt.includes("vault_search"));
+		assert.ok(prompt.includes("read"));
+	});
+
+	it("buildCategorizationPrompt includes descriptions when available", () => {
+		const prompt = buildCategorizationPrompt([{ name: "vault_search", description: "Search vault" }]);
+		assert.ok(prompt.includes("Search vault"));
+	});
+
+	it("parseCategorizationResponse parses valid JSON", () => {
+		const response = JSON.stringify({
+			groups: [
+				{ name: "core", displayName: "Core", description: "Core tools", tools: ["read"] },
+				{ name: "vault", displayName: "Vault", description: "Vault tools", tools: ["vault_search"] },
+			],
+		});
+		const result = parseCategorizationResponse(response, ["read", "vault_search"]);
+		assert.ok(result);
+		assert.equal(result!.length, 2);
+	});
+
+	it("parseCategorizationResponse returns null for missing tools", () => {
+		const response = JSON.stringify({
+			groups: [
+				{ name: "core", displayName: "Core", description: "Core tools", tools: ["read"] },
+			],
+		});
+		// "vault_search" is missing from the response
+		const result = parseCategorizationResponse(response, ["read", "vault_search"]);
+		assert.equal(result, null);
+	});
+
+	it("parseCategorizationResponse strips markdown fences", () => {
+		const response = "```json\n" + JSON.stringify({
+			groups: [{ name: "core", displayName: "Core", description: "Core", tools: ["read"] }],
+		}) + "\n```";
+		const result = parseCategorizationResponse(response, ["read"]);
+		assert.ok(result);
+	});
+
+	it("parseCategorizationResponse returns null for garbage", () => {
+		assert.equal(parseCategorizationResponse("not json at all", ["read"]), null);
+	});
+
+	it("toolHash is stored in config via buildDefaultConfig", () => {
+		const groups = [{ name: "core", displayName: "Core", description: "Core", tools: ["read"] }];
+		const config = buildDefaultConfig(groups, { model: "google/gemini-2.0-flash", toolHash: "abc123" });
+		assert.equal(config.toolHash, "abc123");
+		assert.equal(config.categorizationModel, "google/gemini-2.0-flash");
+		assert.deepEqual(config.toolGroups, groups);
 	});
 });
