@@ -20,7 +20,7 @@
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { DynamicBorder, getAgentDir, getSettingsListTheme } from "@mariozechner/pi-coding-agent";
-import { Container, getKeybindings, Input, Key, type SelectItem, SelectList, type SettingItem, SettingsList, Text } from "@mariozechner/pi-tui";
+import { Container, Key, type SelectItem, SelectList, type SettingItem, SettingsList, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { completeSimple } from "@mariozechner/pi-ai";
 import {
@@ -43,6 +43,7 @@ import {
 	buildCategorizationPrompt,
 	parseCategorizationResponse,
 	mergeGroupsIntoConfig,
+	autoSelectCategorizationModel,
 } from "../lib/lib.js";
 
 function getConfigPath(): string {
@@ -126,9 +127,11 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 		const allTools = pi.getAllTools();
 		const prompt = buildCategorizationPrompt(allTools);
 		const allToolNames = allTools.map((t) => t.name);
+		debugLog(`categorizationWithModel: model=${model?.provider}/${model?.id} toolCount=${allTools.length} toolNames=${allToolNames.join(",")}`);
 
 		try {
 			const { apiKey, headers } = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+			debugLog(`categorizationWithModel: got apiKey=${apiKey ? "yes(" + apiKey.slice(0,8) + "...)" : "NONE"} headers=${JSON.stringify(headers ?? {})}`);
 			const response = await completeSimple(
 				model,
 				{
@@ -147,12 +150,15 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 				.map((c: any) => c.text)
 				.join("");
 
+			debugLog(`categorizationWithModel: response length=${text.length} preview=${JSON.stringify(text.slice(0, 500))}`);
 			const result = parseCategorizationResponse(text, allToolNames);
+			debugLog(`categorizationWithModel: parseResult=${result ? result.length + " groups" : "null"}`);
 			if (!result) {
 				ctx.ui.notify(`LLM returned unparseable response (${text.length} chars)`, "warning");
 			}
 			return result;
 		} catch (err: any) {
+			debugLog(`categorizationWithModel: ERROR ${err?.message ?? err}\n${err?.stack ?? ""}`);
 			ctx.ui.notify(`LLM call failed: ${err?.message ?? err}`, "error");
 			return null;
 		}
@@ -365,131 +371,55 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 
 	// ── Setup Wizard ──────────────────────────────────────────────────────
 
-	async function runSetupWizard(ctx: ExtensionContext, opts?: { firstTime?: boolean }): Promise<boolean> {
-		// ── First-time: pick a model and run LLM categorization ──
+	async function runSetupWizard(ctx: ExtensionContext, opts?: { firstTime?: boolean; showModePicker?: boolean }): Promise<boolean> {
+		// ── First-time: auto-select model → LLM categorization → prefix fallback ──
 		if (opts?.firstTime) {
+			const allTools = pi.getAllTools();
+			const toolCount = allTools.length;
 			const available = ctx.modelRegistry.getAvailable();
-			if (available.length > 0) {
-				const selectItems: SelectItem[] = available.map((m: any) => ({
-					label: `${m.provider}/${m.id}`,
-					value: `${m.provider}/${m.id}`,
-				}));
+			debugLog(`firstTime: toolCount=${toolCount} availableModels=${available.length} models=[${available.map((m: any) => `${m.provider}/${m.id}`).join(", ")}]`);
+			const selectedModel = available.length > 0
+				? autoSelectCategorizationModel(available)
+				: null;
+			debugLog(`firstTime: autoSelected=${selectedModel ?? "NONE"}`);
 
-				// Loop: pick model → try categorization → retry on failure
-				let categorized = false;
-				while (!categorized) {
-					const selectedModel = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
-						const container = new Container();
-						container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
-						container.addChild(new Text(" " + theme.fg("accent", theme.bold("⚡ Pick a fast/cheap LLM")), 1, 0));
-						container.addChild(new Text(" " + theme.fg("dim", "Used for: (1) one-time tool grouping at setup, and"), 1, 0));
-						container.addChild(new Text(" " + theme.fg("dim", "(2) per-message smart tool detection when keywords match."), 1, 0));
-						container.addChild(new Text(" " + theme.fg("dim", "Pick something fast and cheap (e.g. flash, haiku, mini)."), 1, 0));
-						container.addChild(new Text("", 0, 0));
-
-						// Filter input
-						const filterInput = new Input();
-						filterInput.focused = true;
-						container.addChild(filterInput);
-						container.addChild(new Text("", 0, 0));
-
-						const listTheme = {
-							selectedPrefix: (t: string) => theme.fg("accent", t),
-							selectedText: (t: string) => theme.fg("accent", t),
-							description: (t: string) => theme.fg("muted", t),
-							scrollInfo: (t: string) => theme.fg("dim", t),
-							noMatch: (t: string) => theme.fg("warning", t),
-						};
-						let currentFiltered = selectItems;
-						let selectList = new SelectList(currentFiltered, 10, listTheme);
-						selectList.onSelect = (item: SelectItem) => done(item.value);
-						selectList.onCancel = () => done(null);
-
-						// Wrapper so we can swap out the SelectList on filter change
-						const listWrapper: any = {
-							render: (w: number) => selectList.render(w),
-							invalidate: () => selectList.invalidate(),
-						};
-						container.addChild(listWrapper);
-
-						const applyFilter = () => {
-							const q = filterInput.getValue().toLowerCase();
-							currentFiltered = q
-								? selectItems.filter((item) => item.label.toLowerCase().includes(q))
-								: selectItems;
-							selectList = new SelectList(currentFiltered, 10, listTheme);
-							selectList.onSelect = (item: SelectItem) => done(item.value);
-							selectList.onCancel = () => done(null);
-							listWrapper.render = (w: number) => selectList.render(w);
-							listWrapper.invalidate = () => selectList.invalidate();
-						};
-
-						container.addChild(new Text("", 0, 0));
-						container.addChild(new Text(" " + theme.fg("dim", "type to filter • ↑↓ navigate • enter select • esc cancel"), 1, 0));
-						container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
-
-						return {
-							render: (w: number) => container.render(w),
-							invalidate: () => container.invalidate(),
-							handleInput: (data: string) => {
-								const kb = getKeybindings();
-								if (
-									kb.matches(data, "tui.select.up") ||
-									kb.matches(data, "tui.select.down") ||
-									kb.matches(data, "tui.select.pageUp") ||
-									kb.matches(data, "tui.select.pageDown") ||
-									kb.matches(data, "tui.select.confirm")
-								) {
-									selectList.handleInput(data);
-								} else if (kb.matches(data, "tui.select.cancel")) {
-									// If there's filter text, clear it; otherwise cancel
-									if (filterInput.getValue()) {
-										filterInput.setValue("");
-										applyFilter();
-									} else {
-										selectList.handleInput(data);
-									}
-								} else {
-									filterInput.handleInput(data);
-									applyFilter();
-								}
-								tui.requestRender();
-							},
-						};
-					});
-
-					if (!selectedModel) break; // User dismissed
-
-					const model = resolveModel(selectedModel, ctx);
-					if (!model) {
-						ctx.ui.notify(`Could not resolve model: ${selectedModel}`, "error");
-						continue;
-					}
-
-					const toolCount = pi.getAllTools().length;
+			let usedLlm = false;
+			if (selectedModel) {
+				const model = resolveModel(selectedModel, ctx);
+				debugLog(`firstTime: resolvedModel=${model ? "yes" : "null"}`);
+				if (model) {
 					ctx.ui.setStatus("lazy-tools", `⚡ Categorizing ${toolCount} tools with ${selectedModel}...`);
-
 					const parsed = await categorizationWithModel(model, ctx);
 					if (parsed) {
 						toolGroups = parsed;
 						rebuildIndex();
-						const toolHash = computeToolHash(pi.getAllTools());
+						const toolHash = computeToolHash(allTools);
 						config = buildDefaultConfig(toolGroups, { model: selectedModel, toolHash });
 						ctx.ui.setStatus("lazy-tools", `⚡ ${toolCount} tools → ${parsed.length} groups`);
-						categorized = true;
-					} else {
-						ctx.ui.notify(`Categorization failed with ${selectedModel}. Pick another model.`, "warning");
+						usedLlm = true;
 					}
 				}
 			}
-			// No successful categorization → disable, don't save config.
-			// Next boot will show the dialog again.
-			if (!config) {
-				return false;
+
+			// Fallback: prefix-based categorization (no LLM needed)
+			if (!usedLlm) {
+				toolGroups = categorizeTools(allTools);
+				rebuildIndex();
+				const toolHash = computeToolHash(allTools);
+				config = buildDefaultConfig(toolGroups, {
+					model: selectedModel ?? undefined,
+					toolHash,
+				});
+				ctx.ui.setStatus("lazy-tools", `⚡ ${toolCount} tools → ${toolGroups.length} groups (prefix detection)`);
 			}
+
+			// Save config immediately — mode picker is optional polish
+			saveConfigToPath(getConfigPath(), config!);
 		}
 
-		// ── Mode picker ──
+		// ── Mode picker (skip if no UI or explicitly disabled) ──
+		if (opts?.showModePicker === false) return true;
+
 		// Enter/Space cycles mode. SettingsList handles everything natively.
 		const items: SettingItem[] = toolGroups.map((group) => {
 			const isCore = group.name === "core";
@@ -785,6 +715,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 
 		// Load config
 		config = loadConfigFromPath(getConfigPath());
+		debugLog(`session_start: reason=${event.reason} hasUI=${ctx.hasUI} configLoaded=${config !== null} configPath=${getConfigPath()}`);
 
 		// Restore session-activated groups from branch
 		const entries = ctx.sessionManager.getBranch();
@@ -797,17 +728,10 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 			}
 		}
 
-		if (!config && event.reason === "startup" && ctx.hasUI) {
-			// ── First time: model picker → LLM categorization → mode picker ──
-			await runSetupWizard(ctx, { firstTime: true });
-
-			if (!config) {
-				// Setup failed or was dismissed — disable lazy tools for this session
-				isEnabled = false;
-				ctx.ui.setStatus("lazy-tools", undefined);
-				ctx.ui.notify("lazy-tools: setup incomplete, disabled for this session. Use /tools-setup to configure.", "warning");
-				return;
-			}
+		if (!config && event.reason === "startup") {
+			// ── First time: auto-categorize (no UI needed), then optionally show mode picker ──
+			await runSetupWizard(ctx, { firstTime: true, showModePicker: ctx.hasUI });
+			debugLog(`session_start: after firstTime setup, config=${config ? "set" : "null"} groups=${toolGroups.length}`);
 		} else if (config) {
 			const currentHash = computeToolHash(pi.getAllTools());
 
@@ -816,23 +740,47 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 				toolGroups = config.toolGroups;
 				rebuildIndex();
 			} else if (config.toolHash !== currentHash) {
-				// ── Tools changed: re-categorize with saved model ──
+				// ── Tools changed: re-categorize silently ──
+				const previousGroupNames = new Set(Object.keys(config.groups));
 				const reran = await runLlmCategorization(ctx);
 				if (reran) {
-					// Show wizard so user can configure new groups
-					if (ctx.hasUI) await runSetupWizard(ctx);
+					// mergeGroupsIntoConfig preserves existing mode preferences.
+					// Only show wizard if there are genuinely NEW groups the user
+					// hasn't configured yet.
+					const newGroupNames = Object.keys(config!.groups);
+					const hasNewGroups = newGroupNames.some(g => !previousGroupNames.has(g));
+					if (hasNewGroups && ctx.hasUI) {
+						await runSetupWizard(ctx);
+					}
 					saveConfigToPath(getConfigPath(), config!);
 				} else {
-					// LLM failed — wipe config, show first-time setup again
-					config = null;
-					if (ctx.hasUI) {
-						await runSetupWizard(ctx, { firstTime: true });
-					}
-					if (!config) {
-						isEnabled = false;
-						ctx.ui.setStatus("lazy-tools", undefined);
-						ctx.ui.notify("lazy-tools: recategorization failed, disabled. Use /tools-setup to retry.", "warning");
-						return;
+					// LLM failed — fall back to existing groups + prefix detection
+					// for any new tools. Do NOT wipe config or show wizard.
+					if (config.toolGroups) {
+						toolGroups = config.toolGroups;
+						rebuildIndex();
+						// Merge new tools via prefix detection
+						const allTools = pi.getAllTools();
+						const known = new Set(toolGroups.flatMap(g => g.tools));
+						const newTools = allTools.filter(t => !known.has(t.name));
+						if (newTools.length > 0) {
+							const newGroups = categorizeTools(newTools);
+							for (const ng of newGroups) {
+								const existing = toolGroups.find(g => g.name === ng.name);
+								if (existing) {
+									existing.tools.push(...ng.tools);
+								} else {
+									toolGroups.push(ng);
+									config.groups[ng.name] = "on-demand";
+								}
+							}
+							rebuildIndex();
+						}
+						ctx.ui.notify("lazy-tools: tool set changed, using previous groups. Run /tools-setup to reconfigure.", "info");
+					} else {
+						// No saved groups at all — prefix-detect everything
+						toolGroups = categorizeTools(pi.getAllTools());
+						rebuildIndex();
 					}
 				}
 			}

@@ -21,11 +21,13 @@ import {
 	buildCategorizationPrompt,
 	parseCategorizationResponse,
 	mergeGroupsIntoConfig,
+	autoSelectCategorizationModel,
 	GroupIndex,
 	type ToolLike,
 	type ToolGroup,
 	type LazyToolsConfig,
 	type GroupMode,
+	type ModelLike,
 } from "../lib/lib.js";
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
@@ -847,15 +849,30 @@ describe("LLM categorization helpers", () => {
 		assert.equal(result!.length, 2);
 	});
 
-	it("parseCategorizationResponse returns null for missing tools", () => {
+	it("parseCategorizationResponse assigns missing tools to core", () => {
 		const response = JSON.stringify({
 			groups: [
 				{ name: "core", displayName: "Core", description: "Core tools", tools: ["read"] },
 			],
 		});
-		// "vault_search" is missing from the response
+		// "vault_search" is missing from the response — should be added to core
 		const result = parseCategorizationResponse(response, ["read", "vault_search"]);
-		assert.equal(result, null);
+		assert.ok(result);
+		const core = result!.find(g => g.name === "core")!;
+		assert.ok(core.tools.includes("vault_search"), "missing tool should be added to core");
+	});
+
+	it("parseCategorizationResponse strips hallucinated tools", () => {
+		const response = JSON.stringify({
+			groups: [
+				{ name: "core", displayName: "Core", description: "Core tools", tools: ["read", "fake_tool"] },
+			],
+		});
+		const result = parseCategorizationResponse(response, ["read"]);
+		assert.ok(result);
+		const core = result!.find(g => g.name === "core")!;
+		assert.ok(!core.tools.includes("fake_tool"), "hallucinated tool should be removed");
+		assert.ok(core.tools.includes("read"));
 	});
 
 	it("parseCategorizationResponse strips markdown fences", () => {
@@ -876,5 +893,71 @@ describe("LLM categorization helpers", () => {
 		assert.equal(config.toolHash, "abc123");
 		assert.equal(config.categorizationModel, "google/gemini-2.0-flash");
 		assert.deepEqual(config.toolGroups, groups);
+	});
+});
+
+// ─── autoSelectCategorizationModel ─────────────────────────────────────────────
+
+describe("autoSelectCategorizationModel", () => {
+	it("prefers Gemini 2.5 Flash over older versions", () => {
+		const models: ModelLike[] = [
+			{ provider: "anthropic", id: "claude-haiku-4-5" },
+			{ provider: "google", id: "gemini-1.5-flash" },
+			{ provider: "google", id: "gemini-2.0-flash" },
+			{ provider: "google", id: "gemini-2.5-flash" },
+			{ provider: "openai", id: "gpt-4o" },
+		];
+		assert.equal(autoSelectCategorizationModel(models), "google/gemini-2.5-flash");
+	});
+
+	it("prefers 2.0-flash over 1.5-flash", () => {
+		const models: ModelLike[] = [
+			{ provider: "google", id: "gemini-1.5-flash" },
+			{ provider: "google", id: "gemini-2.0-flash" },
+		];
+		assert.equal(autoSelectCategorizationModel(models), "google/gemini-2.0-flash");
+	});
+
+	it("skips flash-lite for 2.5", () => {
+		const models: ModelLike[] = [
+			{ provider: "google", id: "gemini-2.5-flash-lite" },
+			{ provider: "google", id: "gemini-2.0-flash" },
+		];
+		assert.equal(autoSelectCategorizationModel(models), "google/gemini-2.0-flash");
+	});
+
+	it("falls back to Haiku when no Flash available", () => {
+		const models: ModelLike[] = [
+			{ provider: "anthropic", id: "claude-haiku-4-5" },
+			{ provider: "openai", id: "gpt-4o" },
+		];
+		assert.equal(autoSelectCategorizationModel(models), "anthropic/claude-haiku-4-5");
+	});
+
+	it("falls back to gpt-4o-mini when no Flash or Haiku", () => {
+		const models: ModelLike[] = [
+			{ provider: "openai", id: "gpt-4o" },
+			{ provider: "openai", id: "gpt-4o-mini" },
+		];
+		assert.equal(autoSelectCategorizationModel(models), "openai/gpt-4o-mini");
+	});
+
+	it("falls back to first available when no preferred models match", () => {
+		const models: ModelLike[] = [
+			{ provider: "custom", id: "my-model" },
+			{ provider: "openai", id: "gpt-4o" },
+		];
+		assert.equal(autoSelectCategorizationModel(models), "custom/my-model");
+	});
+
+	it("returns null for empty list", () => {
+		assert.equal(autoSelectCategorizationModel([]), null);
+	});
+
+	it("matches Gemini Flash variants", () => {
+		const models: ModelLike[] = [
+			{ provider: "google", id: "gemini-2.5-flash-preview-04-17" },
+		];
+		assert.equal(autoSelectCategorizationModel(models), "google/gemini-2.5-flash-preview-04-17");
 	});
 });

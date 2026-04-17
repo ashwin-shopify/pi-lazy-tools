@@ -307,14 +307,28 @@ export function parseCategorizationResponse(response: string, allToolNames: stri
 			group.description = group.description || `${group.displayName} tools`;
 		}
 
-		// Check no tools were lost
-		const expected = new Set(allToolNames);
-		for (const name of expected) {
-			if (!allAssigned.has(name)) return null; // LLM missed a tool
+		// Strip hallucinated tools (tools the LLM invented that don't exist)
+		const validToolNames = new Set(allToolNames);
+		for (const group of parsed.groups) {
+			group.tools = group.tools.filter(t => validToolNames.has(t));
+		}
+		// Remove empty groups after stripping
+		const groups = parsed.groups.filter(g => g.tools.length > 0);
+
+		// Assign missed tools to core instead of rejecting
+		const assigned = new Set(groups.flatMap(g => g.tools));
+		const missed = allToolNames.filter(t => !assigned.has(t));
+		if (missed.length > 0) {
+			let core = groups.find(g => g.name === "core");
+			if (!core) {
+				core = { name: "core", displayName: "Core", description: "Core tools", tools: [] };
+				groups.unshift(core);
+			}
+			core.tools.push(...missed);
 		}
 
-		ensureCoreTools(parsed.groups);
-		return parsed.groups;
+		ensureCoreTools(groups);
+		return groups;
 	} catch {
 		return null;
 	}
@@ -561,6 +575,46 @@ export function reconcileConfig(
 	}
 
 	return { config: { ...config, groups }, prunedGroups };
+}
+
+// ─── Model Auto-Selection ────────────────────────────────────────────────────
+
+/**
+ * Ranked list of preferred cheap/fast models for categorization.
+ * Checked in order; first available one wins.
+ */
+const PREFERRED_CATEGORIZATION_MODELS: Array<{ provider: string; pattern: RegExp }> = [
+	// Prefer newest flash variants first (cheap + fast + good at structured output)
+	{ provider: "google", pattern: /gemini-2\.5-flash(?!.*lite)/i },
+	{ provider: "google", pattern: /gemini-2\.0-flash/i },
+	{ provider: "google", pattern: /gemini-3.*flash/i },
+	{ provider: "google", pattern: /gemini.*flash/i },
+	{ provider: "anthropic", pattern: /haiku/i },
+	{ provider: "openai", pattern: /gpt-4o-mini/i },
+	{ provider: "openai", pattern: /mini/i },
+];
+
+export interface ModelLike {
+	provider: string;
+	id: string;
+}
+
+/**
+ * Auto-select the best cheap/fast model from available models.
+ * Returns "provider/id" string or null if no match found.
+ */
+export function autoSelectCategorizationModel(available: ModelLike[]): string | null {
+	for (const pref of PREFERRED_CATEGORIZATION_MODELS) {
+		const match = available.find(
+			(m) => m.provider === pref.provider && pref.pattern.test(m.id),
+		);
+		if (match) return `${match.provider}/${match.id}`;
+	}
+	// Fallback: first available model
+	if (available.length > 0) {
+		return `${available[0].provider}/${available[0].id}`;
+	}
+	return null;
 }
 
 // ─── Default Config ──────────────────────────────────────────────────────────
