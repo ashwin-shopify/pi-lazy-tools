@@ -783,10 +783,7 @@ export function inheritModeBySignature(
 	const newSet = new Set(newGroup.tools);
 	let best: { name: string; shared: number } | null = null;
 	for (const old of oldGroups) {
-		let shared = 0;
-		for (const tool of old.tools) {
-			if (newSet.has(tool)) shared++;
-		}
+		const shared = old.tools.filter((tool) => newSet.has(tool)).length;
 		if (shared === 0) continue;
 		if (!best || shared > best.shared) best = { name: old.name, shared };
 	}
