@@ -18,11 +18,11 @@
  */
 
 import { join } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { DynamicBorder, getAgentDir, getSettingsListTheme } from "@mariozechner/pi-coding-agent";
-import { Container, Key, type SelectItem, SelectList, type SettingItem, SettingsList, Text } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
-import { completeSimple } from "@mariozechner/pi-ai";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { Container, Key, type SelectItem, SelectList, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
+import { completeSimple } from "@earendil-works/pi-ai";
 import {
 	type GroupMode,
 	type LazyToolsConfig,
