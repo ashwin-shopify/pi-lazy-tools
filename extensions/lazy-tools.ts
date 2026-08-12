@@ -20,7 +20,7 @@
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
-import { Container, Key, type SelectItem, SelectList, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui";
+import { Container, Key, type SelectItem, SelectList, type SettingItem, SettingsList, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { completeSimple } from "@earendil-works/pi-ai";
 import {
@@ -445,14 +445,14 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 			container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
 			container.addChild(
 				new (class {
-					render(_width: number) {
+					render(width: number) {
 						return [
 							" " + theme.fg("accent", theme.bold("⚡ Lazy Tools Setup")),
 							"",
 							" " + theme.fg("dim", "Configure which tool groups load at startup vs on-demand."),
 							" " + theme.fg("dim", "Enter/Space to cycle mode. Esc to save & close."),
 							"",
-						];
+						].map((line) => truncateToWidth(line, width));
 					}
 					invalidate() {}
 				})(),
@@ -480,11 +480,11 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 
 			container.addChild(
 				new (class {
-					render(_width: number) {
+					render(width: number) {
 						return [
 							"",
 							" " + theme.fg("dim", "enter/space cycle mode • ↑↓ navigate • type to search • esc save & close"),
-						];
+						].map((line) => truncateToWidth(line, width));
 					}
 					invalidate() {}
 				})(),
