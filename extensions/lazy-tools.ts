@@ -44,6 +44,7 @@ import {
 	parseCategorizationResponse,
 	mergeGroupsIntoConfig,
 	autoSelectCategorizationModel,
+	shouldPassthrough,
 } from "../lib/lib.js";
 
 function getConfigPath(): string {
@@ -125,7 +126,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 	 */
 	async function categorizationWithModel(model: any, ctx: ExtensionContext): Promise<ToolGroup[] | null> {
 		const allTools = pi.getAllTools();
-		const prompt = buildCategorizationPrompt(allTools);
+		const prompt = buildCategorizationPrompt(allTools, config?.categorization);
 		const allToolNames = allTools.map((t) => t.name);
 		debugLog(`categorizationWithModel: model=${model?.provider}/${model?.id} toolCount=${allTools.length} toolNames=${allToolNames.join(",")}`);
 
@@ -715,7 +716,19 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 
 		// Load config
 		config = loadConfigFromPath(getConfigPath());
-		debugLog(`session_start: reason=${event.reason} hasUI=${ctx.hasUI} configLoaded=${config !== null} configPath=${getConfigPath()}`);
+		debugLog(`session_start: reason=${event.reason} hasUI=${ctx.hasUI} mode=${ctx.mode} configLoaded=${config !== null} configPath=${getConfigPath()}`);
+
+		// Passthrough: in spawned agents (e.g. team teammates/subagents) and
+		// non-interactive modes, get out of the way entirely. A teammate is a
+		// child pi process reading this same config file; filtering its tools
+		// here strips the team_message/team_shutdown tools it needs to report
+		// back and shut down. Opt-in via config; off by default.
+		if (shouldPassthrough(config?.passthrough, ctx.mode, process.env)) {
+			isEnabled = false;
+			ctx.ui.setStatus("lazy-tools", undefined);
+			debugLog(`session_start: passthrough active (mode=${ctx.mode}) — lazy filtering disabled, all tools remain active`);
+			return;
+		}
 
 		// Restore session-activated groups from branch
 		const entries = ctx.sessionManager.getBranch();

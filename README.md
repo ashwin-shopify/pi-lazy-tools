@@ -17,8 +17,10 @@ This extension categorizes tools into groups and lets you choose which load imme
 ## Install
 
 ```bash
-pi install git:github.com/ashwin-shopify/pi-lazy-tools
+pi install git:github.com/marcuskbra/pi-lazy-tools
 ```
+
+This is a fork of `ashwin-shopify/pi-lazy-tools` that adds durable group modes, a passthrough for spawned agents, and a config-driven categorization prompt. See "Durability and spawned agents" below.
 
 ## Usage
 
@@ -92,9 +94,50 @@ Saved to `~/.pi/agent/lazy-tools.json`:
     "vault": "on-demand",
     "slack": "on-demand",
     "buildkite": "off"
-  }
+  },
+  "preserveModesBySignature": true,
+  "passthrough": {
+    "enabled": true,
+    "modes": ["rpc", "json", "print"],
+    "envMarkers": ["PI_TEAM_ROLE"]
+  },
+  "categorization": { "minGroups": 8, "maxGroups": 12 }
 }
 ```
+
+## Durability and spawned agents
+
+Three opt-in settings live in the same `lazy-tools.json`. They default off, so
+behaviour is unchanged until you enable them. The config file is not touched by
+package updates, and a spawned teammate reads the same file, so enabling a
+setting once carries across updates and into every child pi process.
+
+### preserveModesBySignature
+
+Group modes are stored under the LLM's group name. When the installed tool set
+changes, the extension re-runs the categorization LLM, which may rename a
+cluster (for example `team_management` becomes `team`). A rename used to drop
+your `always` choice back to `on-demand`. With `preserveModesBySignature: true`,
+a re-categorized group inherits the mode of the old group its tools most came
+from, so `always` survives renames.
+
+### passthrough
+
+pi has no native notion of a subagent. A team teammate is just a child pi
+process reading this same config, and this extension's tool filtering would
+strip the `team_message` and `team_shutdown` tools the teammate needs to report
+back and shut down. With `passthrough.enabled: true`, the extension stops
+filtering when either the run mode is in `modes` (a pi-native signal covering
+RPC and one-shot runs) or one of `envMarkers` is present in the environment
+(covering pane-spawned teammates, which run as ordinary `tui` sessions and are
+only identifiable by the role marker their spawner injects). Add other spawner
+markers, such as a future `PI_SUBAGENT`, to `envMarkers` without a code change.
+
+### categorization
+
+The group-count target and grouping guidance handed to the categorization LLM.
+`minGroups`/`maxGroups` default to 8 and 12; set them lower for fewer, broader
+groups. `guidance` overrides the default "one service per group" bullets.
 
 ## Development
 

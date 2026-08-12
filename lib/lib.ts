@@ -32,6 +32,38 @@ export interface LazyToolsConfig {
 	toolHash?: string;
 	/** LLM-generated group definitions (cached) */
 	toolGroups?: ToolGroup[];
+	/**
+	 * Preserve user group modes across LLM re-categorization renames by matching
+	 * new groups to old ones by tool-set signature instead of by group name.
+	 * Opt-in (default off) so existing behaviour is unchanged until enabled.
+	 */
+	preserveModesBySignature?: boolean;
+	/**
+	 * Stop filtering tools in spawned agents and non-interactive sessions.
+	 * Opt-in (default off). Lives in the shared config file, so a teammate
+	 * process reads the same setting the lead wrote.
+	 */
+	passthrough?: PassthroughConfig;
+	/** Tuning for the LLM categorization prompt. */
+	categorization?: CategorizationConfig;
+}
+
+export interface PassthroughConfig {
+	/** Master switch. When false or absent, passthrough never triggers. */
+	enabled?: boolean;
+	/** Run modes (ctx.mode) that trigger passthrough. Default: rpc, json, print. */
+	modes?: string[];
+	/** Env var names whose presence marks a spawned session. Default: PI_TEAM_ROLE. */
+	envMarkers?: string[];
+}
+
+export interface CategorizationConfig {
+	/** Lower bound of the group-count target in the prompt. Default 8. */
+	minGroups?: number;
+	/** Upper bound of the group-count target in the prompt. Default 12. */
+	maxGroups?: number;
+	/** Override for the grouping-guidance bullet lines. */
+	guidance?: string;
 }
 
 // ─── Prompt-based Group Detection ────────────────────────────────────────────
@@ -261,18 +293,28 @@ export function computeToolHash(tools: ToolLike[]): string {
 }
 
 /** Build the system prompt for the categorization LLM call. */
-export function buildCategorizationPrompt(tools: ToolLike[]): string {
+/** Default grouping guidance: one service per group, no catch-alls. */
+export const DEFAULT_CATEGORIZATION_GUIDANCE = [
+	"- Group by PURPOSE and SERVICE, not just by name prefix",
+	"- Each distinct service or platform gets its OWN group (e.g. Buildkite, Observe, Slack, Grokt, Vault, GitHub, Data Portal — all separate)",
+	"- Do NOT merge unrelated services into one group. \"Shopify Developer Tools\" combining Buildkite + Grokt + Vault + GitHub is too broad — split them.",
+].join("\n");
+
+export function buildCategorizationPrompt(tools: ToolLike[], opts?: CategorizationConfig): string {
 	const toolList = tools
 		.map((t) => t.description ? `- ${t.name}: ${t.description}` : `- ${t.name}`)
 		.join("\n");
 
+	const minGroups = opts?.minGroups ?? 8;
+	const maxGroups = opts?.maxGroups ?? 12;
+	const guidance = opts?.guidance ?? DEFAULT_CATEGORIZATION_GUIDANCE;
+
 	return `You are a tool categorizer for a coding assistant. Group these tools so that tools a user needs together are in the same group.
 
 Goals:
-- Group by PURPOSE and SERVICE, not just by name prefix
-- Tools from the same service belong together (e.g. all Google Docs, Sheets, Drive, Workspace tools → one "Google" group)
+${guidance}
 - Tools the user always needs (file I/O, code editing, shell, asking questions, output handling, session management) → "core" group
-- Aim for 3-6 groups total. Fewer is better. Avoid catch-all "utility" groups.
+- Aim for ${minGroups}-${maxGroups} fine-grained groups. Prefer more specific groups over fewer broad ones. Avoid catch-all "utility" groups.
 - Each group needs: name (short lowercase id), displayName (human-readable), description (one line), tools (array)
 - Every tool must appear in exactly one group
 
@@ -382,6 +424,36 @@ export function getGroupMode(config: LazyToolsConfig | null, groupName: string):
 	if (!config) return "always";
 	if (groupName === "core") return "always";
 	return config.groups[groupName] ?? "on-demand";
+}
+
+// ─── Passthrough (spawned / non-interactive sessions) ─────────────────────────
+
+export const DEFAULT_PASSTHROUGH_MODES = ["rpc", "json", "print"];
+export const DEFAULT_PASSTHROUGH_ENV_MARKERS = ["PI_TEAM_ROLE"];
+
+/**
+ * Decide whether lazy-tools should stop filtering for this session.
+ *
+ * pi has no native notion of a subagent: a spawned teammate is just a child
+ * pi process the agent-teams extension launches. RPC-spawned children run in
+ * mode "rpc"; pane-spawned children run in mode "tui" and are indistinguishable
+ * from a human session except for the role marker the spawner injects. So we
+ * combine a pi-native dimension (run mode) with a generic env-marker list, and
+ * pass through when either matches. Returns false unless explicitly enabled.
+ */
+export function shouldPassthrough(
+	passthrough: PassthroughConfig | undefined,
+	mode: string,
+	env: Record<string, string | undefined>,
+): boolean {
+	if (!passthrough?.enabled) return false;
+	const modes = passthrough.modes ?? DEFAULT_PASSTHROUGH_MODES;
+	if (modes.includes(mode)) return true;
+	const markers = passthrough.envMarkers ?? DEFAULT_PASSTHROUGH_ENV_MARKERS;
+	return markers.some((name) => {
+		const value = env[name];
+		return value !== undefined && value !== "";
+	});
 }
 
 // ─── Active Tool Computation ─────────────────────────────────────────────────
@@ -645,21 +717,80 @@ export function mergeGroupsIntoConfig(
 	newGroups: ToolGroup[],
 	toolHash: string,
 ): LazyToolsConfig {
-	const modes = { ...config.groups };
-	for (const group of newGroups) {
-		if (!(group.name in modes)) {
-			modes[group.name] = "on-demand";
-		}
-	}
-	// Remove modes for groups that no longer exist
-	const validNames = new Set(newGroups.map((g) => g.name));
-	for (const key of Object.keys(modes)) {
-		if (!validNames.has(key)) delete modes[key];
-	}
+	const modes: Record<string, GroupMode> = config.preserveModesBySignature
+		? mergeModesBySignature(config, newGroups)
+		: mergeModesByName(config.groups, newGroups);
 	return {
 		...config,
 		groups: modes,
 		toolHash,
 		toolGroups: newGroups,
 	};
+}
+
+/** Name-keyed merge: preserve modes for same-named groups, drop stale ones. */
+function mergeModesByName(
+	oldModes: Record<string, GroupMode>,
+	newGroups: ToolGroup[],
+): Record<string, GroupMode> {
+	const modes = { ...oldModes };
+	for (const group of newGroups) {
+		if (!(group.name in modes)) {
+			modes[group.name] = "on-demand";
+		}
+	}
+	const validNames = new Set(newGroups.map((g) => g.name));
+	for (const key of Object.keys(modes)) {
+		if (!validNames.has(key)) delete modes[key];
+	}
+	return modes;
+}
+
+/**
+ * Signature-keyed merge: preserve modes across renames. A new group keeps its
+ * mode by name when the name still exists; otherwise it inherits the mode of
+ * the old group its tools most came from. This survives the LLM renaming a
+ * cluster (e.g. "team_management" → "team"), which is what silently reset
+ * "always" choices to "on-demand" before.
+ */
+function mergeModesBySignature(
+	config: LazyToolsConfig,
+	newGroups: ToolGroup[],
+): Record<string, GroupMode> {
+	const oldGroups = config.toolGroups ?? [];
+	const modes: Record<string, GroupMode> = {};
+	for (const group of newGroups) {
+		if (group.name in config.groups) {
+			modes[group.name] = config.groups[group.name];
+			continue;
+		}
+		modes[group.name] = inheritModeBySignature(group, oldGroups, config.groups) ?? "on-demand";
+	}
+	return modes;
+}
+
+/**
+ * Find the mode of the old group that a new group's tools most came from.
+ * Returns the inherited mode when at least half of the new group's tools were
+ * in a single old group, otherwise undefined.
+ */
+export function inheritModeBySignature(
+	newGroup: ToolGroup,
+	oldGroups: ToolGroup[],
+	oldModes: Record<string, GroupMode>,
+): GroupMode | undefined {
+	if (newGroup.tools.length === 0) return undefined;
+	const newSet = new Set(newGroup.tools);
+	let best: { name: string; shared: number } | null = null;
+	for (const old of oldGroups) {
+		let shared = 0;
+		for (const tool of old.tools) {
+			if (newSet.has(tool)) shared++;
+		}
+		if (shared === 0) continue;
+		if (!best || shared > best.shared) best = { name: old.name, shared };
+	}
+	if (!best) return undefined;
+	if (best.shared / newGroup.tools.length < 0.5) return undefined;
+	return oldModes[best.name];
 }
