@@ -632,8 +632,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 	pi.registerCommand("tools-status", {
 		description: "Show current tool group status",
 		handler: async (_args, ctx) => {
-			const lines: string[] = [];
-			for (const group of toolGroups) {
+			const rows = toolGroups.map((group) => {
 				const mode = getGroupMode(config, group.name);
 				const loaded = sessionActivated.has(group.name);
 				const icon = mode === "always" || loaded ? "●" : mode === "on-demand" ? "○" : "✕";
@@ -644,8 +643,14 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 						: mode === "on-demand"
 							? "on-demand"
 							: "off";
-				lines.push(`${icon} ${group.displayName} (${group.tools.length}) — ${status}`);
-			}
+				return { icon, label: `${group.displayName} (${group.tools.length})`, status };
+			});
+			// Pad the label to a uniform width so the status column lines up.
+			const statusLabelWidth = Math.max(0, ...rows.map((r) => visibleWidth(r.label)));
+			const lines = rows.map((r) => {
+				const padded = r.label + " ".repeat(Math.max(0, statusLabelWidth - visibleWidth(r.label)));
+				return `${r.icon} ${padded} — ${r.status}`;
+			});
 			ctx.ui.notify(lines.join("\n"), "info");
 		},
 	});
