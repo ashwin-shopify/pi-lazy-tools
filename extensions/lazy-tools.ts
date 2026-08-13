@@ -133,8 +133,13 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 		try {
 			const { apiKey, headers } = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 			debugLog(`categorizationWithModel: got apiKey=${apiKey ? "yes(" + apiKey.slice(0,8) + "...)" : "NONE"} headers=${JSON.stringify(headers ?? {})}`);
+			// Disable thinking for this call. Categorization is a small structured-JSON
+			// task, and gemini flash models otherwise burn thousands of hidden reasoning
+			// tokens (10-20s, and a risk of exhausting maxTokens before emitting JSON).
+			// Turning reasoning off yields the same grouping in about four seconds and is
+			// a no-op for models that do not reason. Mirrors the shop-pi-fy gate idiom.
 			const response = await completeSimple(
-				model,
+				{ ...model, reasoning: false },
 				{
 					systemPrompt: prompt,
 					messages: [{
