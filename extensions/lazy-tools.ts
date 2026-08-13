@@ -20,7 +20,7 @@
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
-import { Container, Key, type SelectItem, SelectList, type SettingItem, SettingsList, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { Container, Key, type SelectItem, SelectList, type SettingItem, SettingsList, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { completeSimple } from "@earendil-works/pi-ai";
 import {
@@ -438,11 +438,19 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 		if (opts?.showModePicker === false) return true;
 
 		// Enter/Space cycles mode. SettingsList handles everything natively.
-		const items: SettingItem[] = toolGroups.map((group) => {
+		// Pad every label to a uniform width so the mode column lines up. pi-tui's
+		// SettingsList caps its own label padding at 30 columns, so a label longer
+		// than that would get no padding and push its value out of alignment; giving
+		// every label the same width makes that cap a no-op and keeps the columns
+		// aligned regardless of the longest group name.
+		const rawLabels = toolGroups.map((group) => `${group.displayName} (${group.tools.length} tools)`);
+		const labelWidth = Math.max(0, ...rawLabels.map((l) => visibleWidth(l)));
+		const items: SettingItem[] = toolGroups.map((group, i) => {
 			const isCore = group.name === "core";
+			const label = rawLabels[i] + " ".repeat(Math.max(0, labelWidth - visibleWidth(rawLabels[i])));
 			return {
 				id: group.name,
-				label: `${group.displayName} (${group.tools.length} tools)`,
+				label,
 				description: group.tools.join(", "),
 				currentValue: isCore ? "always" : (config?.groups[group.name] ?? "on-demand"),
 				values: isCore ? ["always"] : ["always", "on-demand", "off"],
