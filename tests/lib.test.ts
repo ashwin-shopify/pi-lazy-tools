@@ -912,12 +912,29 @@ describe("autoSelectCategorizationModel", () => {
 		assert.equal(autoSelectCategorizationModel(models), "google/gemini-2.5-flash");
 	});
 
-	it("prefers 2.0-flash over 1.5-flash", () => {
+	it("prefers the flash-latest alias over numbered flash", () => {
 		const models: ModelLike[] = [
-			{ provider: "google", id: "gemini-1.5-flash" },
-			{ provider: "google", id: "gemini-2.0-flash" },
+			{ provider: "google", id: "gemini-2.5-flash" },
+			{ provider: "google", id: "gemini-3.5-flash" },
+			{ provider: "google", id: "gemini-flash-latest" },
 		];
-		assert.equal(autoSelectCategorizationModel(models), "google/gemini-2.0-flash");
+		assert.equal(autoSelectCategorizationModel(models), "google/gemini-flash-latest");
+	});
+
+	it("prefers gemini-3 flash over gemini-2.5 flash", () => {
+		const models: ModelLike[] = [
+			{ provider: "google", id: "gemini-2.5-flash" },
+			{ provider: "google", id: "gemini-3.5-flash" },
+		];
+		assert.equal(autoSelectCategorizationModel(models), "google/gemini-3.5-flash");
+	});
+
+	it("prefers full flash over the lite alias", () => {
+		const models: ModelLike[] = [
+			{ provider: "google", id: "gemini-flash-lite-latest" },
+			{ provider: "google", id: "gemini-2.5-flash" },
+		];
+		assert.equal(autoSelectCategorizationModel(models), "google/gemini-2.5-flash");
 	});
 
 	it("skips flash-lite for 2.5", () => {

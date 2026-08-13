@@ -656,14 +656,21 @@ export function reconcileConfig(
  * Checked in order; first available one wins.
  */
 const PREFERRED_CATEGORIZATION_MODELS: Array<{ provider: string; pattern: RegExp }> = [
-	// Prefer newest flash variants first (cheap + fast + good at structured output)
+	// Full flash first, newest first, quality over raw speed. A categorization
+	// benchmark showed gemini-flash-latest gives the cleanest grouping at about
+	// four seconds once thinking is disabled, while flash-lite variants are
+	// faster but coarser, so lite ranks below full flash. The floating "latest"
+	// alias leads so auto-select tracks Google's newest flash without a code
+	// change. Non-lite patterns use a lookahead so a lite id never matches them.
+	{ provider: "google", pattern: /gemini-flash-latest/i },
+	{ provider: "google", pattern: /gemini-3.*flash(?!.*lite)/i },
 	{ provider: "google", pattern: /gemini-2\.5-flash(?!.*lite)/i },
-	{ provider: "google", pattern: /gemini-2\.0-flash/i },
-	{ provider: "google", pattern: /gemini-3.*flash/i },
+	{ provider: "google", pattern: /gemini.*flash(?!.*lite)/i },
+	{ provider: "google", pattern: /gemini-flash-lite-latest/i },
 	{ provider: "google", pattern: /gemini.*flash/i },
 	{ provider: "anthropic", pattern: /haiku/i },
 	{ provider: "openai", pattern: /gpt-4o-mini/i },
-	{ provider: "openai", pattern: /mini/i },
+	{ provider: "openai", pattern: /(mini|nano)/i },
 ];
 
 export interface ModelLike {
