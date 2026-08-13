@@ -121,6 +121,22 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 	}
 
 	/**
+	 * Extra request params that disable hidden thinking for google models.
+	 * gemini flash otherwise spends thousands of reasoning tokens on these small
+	 * structured-JSON calls, which is slow and can truncate the JSON. The
+	 * reasoning_effort lever is a no-op for google through the proxy (its
+	 * thinkingLevelMap.off is null), so we pass the LiteLLM extra_body that reaches
+	 * the model with a zero thinking budget. Only openai-compatible adapters read
+	 * samplingParams; native backends and non-google models ignore it, so this is
+	 * safe to pass unconditionally.
+	 */
+	function thinkingOffParams(model: any): Record<string, unknown> | undefined {
+		return model?.provider === "google"
+			? { extra_body: { google: { thinking_config: { thinking_budget: 0 } } } }
+			: undefined;
+	}
+
+	/**
 	 * Run LLM categorization with a specific model.
 	 * Returns the parsed groups or null on failure.
 	 */
@@ -133,13 +149,8 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 		try {
 			const { apiKey, headers } = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 			debugLog(`categorizationWithModel: got apiKey=${apiKey ? "yes(" + apiKey.slice(0,8) + "...)" : "NONE"} headers=${JSON.stringify(headers ?? {})}`);
-			// Disable thinking for this call. Categorization is a small structured-JSON
-			// task, and gemini flash models otherwise burn thousands of hidden reasoning
-			// tokens (10-20s, and a risk of exhausting maxTokens before emitting JSON).
-			// Turning reasoning off yields the same grouping in about four seconds and is
-			// a no-op for models that do not reason. Mirrors the shop-pi-fy gate idiom.
 			const response = await completeSimple(
-				{ ...model, reasoning: false },
+				model,
 				{
 					systemPrompt: prompt,
 					messages: [{
@@ -148,7 +159,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 						timestamp: Date.now(),
 					}],
 				},
-				{ maxTokens: 4096, apiKey, headers },
+				{ maxTokens: 8192, apiKey, headers, samplingParams: thinkingOffParams(model) },
 			);
 
 			const text = response.content
@@ -273,7 +284,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 						timestamp: Date.now(),
 					}],
 				},
-				{ maxTokens: 256, apiKey, headers },
+				{ maxTokens: 256, apiKey, headers, samplingParams: thinkingOffParams(model) },
 			);
 			const text = response.content
 				.filter((c: any) => c.type === "text")
