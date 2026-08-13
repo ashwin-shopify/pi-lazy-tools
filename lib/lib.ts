@@ -326,16 +326,39 @@ Respond with ONLY valid JSON, no markdown fences:
 }
 
 /** Parse LLM response into ToolGroup[]. Returns null if parsing fails. */
+/**
+ * Pull a JSON object out of an LLM response that may be wrapped in a markdown
+ * fence or surrounded by prose. Tries, in order: a fenced code block anywhere in
+ * the text, the whole trimmed string, and the substring between the first "{"
+ * and the last "}". Returns the first candidate that parses, else null. This
+ * keeps categorization working when a model prefixes a sentence like "Here are
+ * the groups:" or adds a trailing note around the JSON.
+ */
+function extractJsonObject(response: string): unknown {
+	const text = response.trim();
+	const candidates: string[] = [];
+	const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+	if (fence) candidates.push(fence[1].trim());
+	candidates.push(text);
+	const first = text.indexOf("{");
+	const last = text.lastIndexOf("}");
+	if (first !== -1 && last > first) candidates.push(text.slice(first, last + 1));
+	for (const candidate of candidates) {
+		try {
+			return JSON.parse(candidate);
+		} catch {
+			// try the next candidate
+		}
+	}
+	return null;
+}
+
 export function parseCategorizationResponse(response: string, allToolNames: string[]): ToolGroup[] | null {
 	try {
-		// Strip markdown fences if present
-		let json = response.trim();
-		if (json.startsWith("```")) {
-			json = json.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
-		}
-
-		const parsed = JSON.parse(json) as { groups: ToolGroup[] };
-		if (!parsed.groups || !Array.isArray(parsed.groups)) return null;
+		// Models often wrap the JSON in a markdown fence or add a sentence before or
+		// after it, so we do not assume the whole string is JSON.
+		const parsed = extractJsonObject(response) as { groups: ToolGroup[] } | null;
+		if (!parsed || !parsed.groups || !Array.isArray(parsed.groups)) return null;
 
 		// Validate: every tool must appear exactly once
 		const allAssigned = new Set<string>();

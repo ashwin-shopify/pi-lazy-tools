@@ -885,6 +885,24 @@ describe("LLM categorization helpers", () => {
 		assert.ok(result);
 	});
 
+	it("parseCategorizationResponse handles a prose preamble before a fenced block", () => {
+		const response = "Here are the tool groups:\n\n```json\n" + JSON.stringify({
+			groups: [{ name: "core", displayName: "Core", description: "Core", tools: ["read"] }],
+		}) + "\n```\n\nLet me know if you want changes.";
+		const result = parseCategorizationResponse(response, ["read"]);
+		assert.ok(result, "should parse JSON wrapped in prose and a fence");
+		assert.ok(result!.find(g => g.name === "core"));
+	});
+
+	it("parseCategorizationResponse handles prose around a raw (unfenced) object", () => {
+		const response = "Sure! " + JSON.stringify({
+			groups: [{ name: "core", displayName: "Core", description: "Core", tools: ["read"] }],
+		}) + " Hope that helps.";
+		const result = parseCategorizationResponse(response, ["read"]);
+		assert.ok(result, "should slice the outermost braces out of surrounding prose");
+		assert.ok(result!.find(g => g.name === "core"));
+	});
+
 	it("parseCategorizationResponse returns null for garbage", () => {
 		assert.equal(parseCategorizationResponse("not json at all", ["read"]), null);
 	});
