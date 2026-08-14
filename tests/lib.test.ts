@@ -24,6 +24,8 @@ import {
 	autoSelectCategorizationModel,
 	GroupIndex,
 	shouldPassthrough,
+	shouldBackgroundCategorize,
+	runCategorizationMaybeDeferred,
 	inheritModeBySignature,
 	type ToolLike,
 	type ToolGroup,
@@ -1038,6 +1040,101 @@ describe("shouldPassthrough", () => {
 		const cfg = { enabled: true, modes: [] as string[], envMarkers: ["PI_SUBAGENT"] };
 		assert.equal(shouldPassthrough(cfg, "tui", { PI_SUBAGENT: "1" }), true);
 		assert.equal(shouldPassthrough(cfg, "tui", { PI_TEAM_ROLE: "teammate" }), false);
+	});
+});
+
+// ─── shouldBackgroundCategorize ────────────────────────────────────────
+
+describe("shouldBackgroundCategorize", () => {
+	it("returns false when the config is undefined", () => {
+		assert.equal(shouldBackgroundCategorize(undefined), false);
+	});
+
+	it("returns false when enabled is absent or false", () => {
+		assert.equal(shouldBackgroundCategorize({}), false);
+		assert.equal(shouldBackgroundCategorize({ enabled: false }), false);
+	});
+
+	it("returns true only when enabled is exactly true", () => {
+		assert.equal(shouldBackgroundCategorize({ enabled: true }), true);
+	});
+});
+
+// ─── runCategorizationMaybeDeferred ──────────────────────────────────
+
+describe("runCategorizationMaybeDeferred", () => {
+	it("blocking: awaits runCategorization and does not apply cached groups", async () => {
+		const order: string[] = [];
+		let resolved = false;
+		await runCategorizationMaybeDeferred(false, {
+			applyCachedGroups: () => order.push("cached"),
+			runCategorization: async () => {
+				order.push("llm-start");
+				await Promise.resolve();
+				resolved = true;
+				order.push("llm-done");
+			},
+		});
+		// The await returned only after runCategorization fully resolved.
+		assert.equal(resolved, true);
+		assert.deepEqual(order, ["llm-start", "llm-done"]);
+	});
+
+	it("deferred: applies cached groups synchronously and returns before the LLM resolves", async () => {
+		const order: string[] = [];
+		let llmDone = false;
+		let release!: () => void;
+		const gate = new Promise<void>((r) => { release = r; });
+		const scheduled: Array<() => void> = [];
+		await runCategorizationMaybeDeferred(true, {
+			applyCachedGroups: () => order.push("cached"),
+			runCategorization: async () => {
+				order.push("llm-start");
+				await gate;
+				llmDone = true;
+				order.push("llm-done");
+			},
+			schedule: (task) => { scheduled.push(task); },
+		});
+		// Returned already: cached applied, LLM not started, not done.
+		assert.deepEqual(order, ["cached"]);
+		assert.equal(llmDone, false);
+		assert.equal(scheduled.length, 1);
+		// Drain the scheduled background work.
+		scheduled[0]!();
+		release();
+		await gate;
+		await Promise.resolve();
+		assert.equal(llmDone, true);
+		assert.deepEqual(order, ["cached", "llm-start", "llm-done"]);
+	});
+
+	it("deferred: a rejecting background categorization does not throw to the caller", async () => {
+		const scheduled: Array<() => void> = [];
+		await runCategorizationMaybeDeferred(true, {
+			applyCachedGroups: () => {},
+			runCategorization: async () => { throw new Error("llm boom"); },
+			schedule: (task) => { scheduled.push(task); },
+		});
+		// Draining the background task must not throw synchronously.
+		assert.doesNotThrow(() => scheduled[0]!());
+		await Promise.resolve();
+	});
+
+	it("deferred: returns without awaiting completion using the default scheduler", async () => {
+		let done = false;
+		let release!: () => void;
+		const gate = new Promise<void>((r) => { release = r; });
+		await runCategorizationMaybeDeferred(true, {
+			applyCachedGroups: () => {},
+			runCategorization: async () => { await gate; done = true; },
+		});
+		// Returned even though the background pass is still blocked on the gate.
+		assert.equal(done, false);
+		release();
+		await gate;
+		await Promise.resolve();
+		assert.equal(done, true, "background work completes once unblocked");
 	});
 });
 
