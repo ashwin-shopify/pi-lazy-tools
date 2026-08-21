@@ -46,6 +46,14 @@ export interface LazyToolsConfig {
 	passthrough?: PassthroughConfig;
 	/** Tuning for the LLM categorization prompt. */
 	categorization?: CategorizationConfig;
+	/**
+	 * Run LLM categorization off the awaited startup path on the
+	 * tool-set-changed and first-run paths. Opt-in (default off): when enabled,
+	 * cached groups apply immediately and the LLM pass runs in the background,
+	 * so startup is not blocked on model latency. The first prompt after a
+	 * tool-set change may briefly see the previous grouping until it lands.
+	 */
+	backgroundCategorization?: BackgroundCategorizationConfig;
 }
 
 export interface PassthroughConfig {
@@ -55,6 +63,11 @@ export interface PassthroughConfig {
 	modes?: string[];
 	/** Env var names whose presence marks a spawned session. Default: PI_TEAM_ROLE. */
 	envMarkers?: string[];
+}
+
+export interface BackgroundCategorizationConfig {
+	/** Master switch. When false or absent, categorization stays blocking. */
+	enabled?: boolean;
 }
 
 export interface CategorizationConfig {
@@ -512,11 +525,57 @@ export function shouldPassthrough(
 ): boolean {
 	if (!passthrough?.enabled) return false;
 	const modes = passthrough.modes ?? DEFAULT_PASSTHROUGH_MODES;
+
 	if (modes.includes(mode)) return true;
 	const markers = passthrough.envMarkers ?? DEFAULT_PASSTHROUGH_ENV_MARKERS;
 	return markers.some((name) => {
 		const value = env[name];
 		return value !== undefined && value !== "";
+	});
+}
+
+/**
+ * Decide whether the tool-set-changed and first-run categorization should run
+ * off the awaited startup path. Returns false unless explicitly enabled, so
+ * default behaviour stays blocking and unchanged.
+ */
+export function shouldBackgroundCategorize(
+	cfg: BackgroundCategorizationConfig | undefined,
+): boolean {
+	return cfg?.enabled === true;
+}
+
+/** Dependencies for the deferrable categorization orchestrator. */
+export interface DeferredCategorizationDeps {
+	/** Apply cached groups now, prefix-detecting any new tools. Cheap, synchronous. */
+	applyCachedGroups: () => void;
+	/** The slow path: LLM categorization plus apply and persist. */
+	runCategorization: () => Promise<void>;
+	/** Schedule background work off the awaited path. Defaults to a microtask. */
+	schedule?: (task: () => void) => void;
+}
+
+/**
+ * Run categorization on the tool-set-changed / first-run path, either blocking
+ * (default) or deferred (opt-in). When deferred, cached groups are applied at
+ * once and the LLM pass runs in the background, so startup is not blocked on
+ * model latency.
+ */
+export async function runCategorizationMaybeDeferred(
+	defer: boolean,
+	deps: DeferredCategorizationDeps,
+): Promise<void> {
+	if (!defer) {
+		await deps.runCategorization();
+		return;
+	}
+	deps.applyCachedGroups();
+	const schedule =
+		deps.schedule ?? ((task: () => void) => void Promise.resolve().then(task));
+	schedule(() => {
+		// Background pass: swallow errors so an unhandled rejection can never
+		// crash the session that already started without waiting for it.
+		void deps.runCategorization().catch(() => {});
 	});
 }
 

@@ -101,13 +101,14 @@ Saved to `~/.pi/agent/lazy-tools.json`:
     "modes": ["rpc", "json", "print"],
     "envMarkers": ["PI_TEAM_ROLE"]
   },
-  "categorization": { "minGroups": 8, "maxGroups": 12 }
+  "categorization": { "minGroups": 8, "maxGroups": 12 },
+  "backgroundCategorization": { "enabled": true }
 }
 ```
 
 ## Durability and spawned agents
 
-Three opt-in settings live in the same `lazy-tools.json`. They default off, so
+Four opt-in settings live in the same `lazy-tools.json`. They default off, so
 behaviour is unchanged until you enable them. The config file is not touched by
 package updates, and a spawned teammate reads the same file, so enabling a
 setting once carries across updates and into every child pi process.
@@ -138,6 +139,22 @@ markers, such as a future `PI_SUBAGENT`, to `envMarkers` without a code change.
 The group-count target and grouping guidance handed to the categorization LLM.
 `minGroups`/`maxGroups` default to 8 and 12; set them lower for fewer, broader
 groups. `guidance` overrides the default "one service per group" bullets.
+
+### backgroundCategorization
+
+When the installed tool set changes, the extension re-runs the categorization
+LLM. That call is normally awaited inside `session_start`, so startup blocks for
+the full model latency (seconds) before the session is usable. With
+`backgroundCategorization.enabled: true`, the extension applies the previously
+cached groups at once (prefix-detecting any new tools), lets the session start,
+and runs the LLM pass in the background, swapping in the fresh groups when it
+finishes. The tradeoff: the first prompt right after a tool-set change may
+briefly see the previous grouping until the background pass lands. Default off,
+so the blocking behaviour is unchanged until you enable it.
+
+The `bench/background-categorization.mts` script shows the effect with the LLM
+stubbed to a fixed latency: the awaited startup time drops from the full latency
+to roughly zero.
 
 ## Development
 

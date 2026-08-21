@@ -45,6 +45,8 @@ import {
 	mergeGroupsIntoConfig,
 	autoSelectCategorizationModel,
 	shouldPassthrough,
+	shouldBackgroundCategorize,
+	runCategorizationMaybeDeferred,
 } from "../lib/lib.js";
 
 function getConfigPath(): string {
@@ -782,26 +784,18 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 				toolGroups = config.toolGroups;
 				rebuildIndex();
 			} else if (config.toolHash !== currentHash) {
-				// ── Tools changed: re-categorize silently ──
+				// ── Tools changed: re-categorize ──
 				const previousGroupNames = new Set(Object.keys(config.groups));
-				const reran = await runLlmCategorization(ctx);
-				if (reran) {
-					// mergeGroupsIntoConfig preserves existing mode preferences.
-					// Only show wizard if there are genuinely NEW groups the user
-					// hasn't configured yet.
-					const newGroupNames = Object.keys(config!.groups);
-					const hasNewGroups = newGroupNames.some(g => !previousGroupNames.has(g));
-					if (hasNewGroups && ctx.hasUI) {
-						await runSetupWizard(ctx);
-					}
-					saveConfigToPath(getConfigPath(), config!);
-				} else {
-					// LLM failed — fall back to existing groups + prefix detection
-					// for any new tools. Do NOT wipe config or show wizard.
-					if (config.toolGroups) {
-						toolGroups = config.toolGroups;
+				const defer = shouldBackgroundCategorize(config.backgroundCategorization);
+
+				// Apply the previous groups now, prefix-detecting any new tools.
+				// This is the immediate, cheap grouping used both as the deferred
+				// startup grouping and as the blocking-path fallback when the LLM
+				// pass fails. Behaviour is identical to the prior inline fallback.
+				const applyCachedGroups = () => {
+					if (config!.toolGroups) {
+						toolGroups = config!.toolGroups;
 						rebuildIndex();
-						// Merge new tools via prefix detection
 						const allTools = pi.getAllTools();
 						const known = new Set(toolGroups.flatMap(g => g.tools));
 						const newTools = allTools.filter(t => !known.has(t.name));
@@ -813,18 +807,50 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 									existing.tools.push(...ng.tools);
 								} else {
 									toolGroups.push(ng);
-									config.groups[ng.name] = "on-demand";
+									config!.groups[ng.name] = "on-demand";
 								}
 							}
 							rebuildIndex();
 						}
-						ctx.ui.notify("lazy-tools: tool set changed, using previous groups. Run /tools-setup to reconfigure.", "info");
 					} else {
 						// No saved groups at all — prefix-detect everything
 						toolGroups = categorizeTools(pi.getAllTools());
 						rebuildIndex();
 					}
-				}
+				};
+
+				const runCategorization = async () => {
+					const reran = await runLlmCategorization(ctx);
+					if (reran) {
+						// mergeGroupsIntoConfig preserves existing mode preferences.
+						// Only show wizard if there are genuinely NEW groups the user
+						// hasn't configured yet. Skip the interactive wizard when
+						// deferred: a background pass must not seize the UI after the
+						// session has already started; the status line signals the swap.
+						const newGroupNames = Object.keys(config!.groups);
+						const hasNewGroups = newGroupNames.some(g => !previousGroupNames.has(g));
+						if (hasNewGroups && ctx.hasUI && !defer) {
+							await runSetupWizard(ctx);
+						}
+						saveConfigToPath(getConfigPath(), config!);
+					} else if (!defer) {
+						// Blocking path, LLM failed: fall back to previous groups +
+						// prefix detection and tell the user.
+						applyCachedGroups();
+						ctx.ui.notify("lazy-tools: tool set changed, using previous groups. Run /tools-setup to reconfigure.", "info");
+					}
+					// Deferred: cached groups were applied up front and the session
+					// already started, so swap in whatever the pass produced.
+					if (defer) {
+						applyActiveTools();
+						updateStatus(ctx);
+					}
+				};
+
+				await runCategorizationMaybeDeferred(defer, {
+					applyCachedGroups,
+					runCategorization,
+				});
 			}
 		}
 
