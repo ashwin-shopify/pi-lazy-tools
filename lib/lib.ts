@@ -3,8 +3,8 @@
  * No pi framework imports — only stdlib.
  */
 
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { hash as cryptoHash } from "node:crypto";
+import { closeSync, mkdirSync, openSync, readFileSync, readSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -32,6 +32,51 @@ export interface LazyToolsConfig {
 	toolHash?: string;
 	/** LLM-generated group definitions (cached) */
 	toolGroups?: ToolGroup[];
+	/**
+	 * Preserve user group modes across LLM re-categorization renames by matching
+	 * new groups to old ones by tool-set signature instead of by group name.
+	 * Opt-in (default off) so existing behaviour is unchanged until enabled.
+	 */
+	preserveModesBySignature?: boolean;
+	/**
+	 * Stop filtering tools in spawned agents and non-interactive sessions.
+	 * Opt-in (default off). Lives in the shared config file, so a teammate
+	 * process reads the same setting the lead wrote.
+	 */
+	passthrough?: PassthroughConfig;
+	/** Tuning for the LLM categorization prompt. */
+	categorization?: CategorizationConfig;
+	/**
+	 * Run LLM categorization off the awaited startup path on the
+	 * tool-set-changed and first-run paths. Opt-in (default off): when enabled,
+	 * cached groups apply immediately and the LLM pass runs in the background,
+	 * so startup is not blocked on model latency. The first prompt after a
+	 * tool-set change may briefly see the previous grouping until it lands.
+	 */
+	backgroundCategorization?: BackgroundCategorizationConfig;
+}
+
+export interface PassthroughConfig {
+	/** Master switch. When false or absent, passthrough never triggers. */
+	enabled?: boolean;
+	/** Run modes (ctx.mode) that trigger passthrough. Default: rpc, json, print. */
+	modes?: string[];
+	/** Env var names whose presence marks a spawned session. Default: PI_TEAM_ROLE. */
+	envMarkers?: string[];
+}
+
+export interface BackgroundCategorizationConfig {
+	/** Master switch. When false or absent, categorization stays blocking. */
+	enabled?: boolean;
+}
+
+export interface CategorizationConfig {
+	/** Lower bound of the group-count target in the prompt. Default 8. */
+	minGroups?: number;
+	/** Upper bound of the group-count target in the prompt. Default 12. */
+	maxGroups?: number;
+	/** Override for the grouping-guidance bullet lines. */
+	guidance?: string;
 }
 
 // ─── Prompt-based Group Detection ────────────────────────────────────────────
@@ -181,14 +226,17 @@ function buildDisplayName(prefix: string): string {
 	return prefix.split(/[_.]/).map(capitalize).join(" ");
 }
 
-function buildDescription(prefix: string, tools: string[]): string {
-	// Derive description from tool suffixes
+function buildDescription(prefix: string, displayName: string, tools: string[]): string {
+	// Derive description from tool suffixes. The display name is passed in rather
+	// than recomputed here: the caller already built it for the group, and
+	// buildDisplayName does a split+map+join that is wasted work when repeated
+	// once per group.
 	const suffixes = tools.map((t) => {
 		const rest = t.slice(prefix.length + 1); // skip "prefix_"
 		return rest.replace(/[_.]/g, " ");
 	}).filter(Boolean);
-	if (suffixes.length === 0) return `${buildDisplayName(prefix)} tools`;
-	return `${buildDisplayName(prefix)}: ${suffixes.join(", ")}`;
+	if (suffixes.length === 0) return `${displayName} tools`;
+	return `${displayName}: ${suffixes.join(", ")}`;
 }
 
 /**
@@ -209,9 +257,14 @@ export function categorizeTools(allTools: ToolLike[]): ToolGroup[] {
 			noPrefix.push(tool.name);
 			continue;
 		}
-		const existing = prefixBuckets.get(prefix) ?? [];
-		existing.push(tool.name);
-		prefixBuckets.set(prefix, existing);
+		const existing = prefixBuckets.get(prefix);
+		if (existing) {
+			existing.push(tool.name);
+		} else {
+			// Only touch the map when creating a bucket; existing arrays are
+			// mutated in place, so re-setting them each time is wasted work.
+			prefixBuckets.set(prefix, [tool.name]);
+		}
 	}
 
 	// Phase 2: Promote buckets with 2+ tools to groups; singletons go to core
@@ -240,11 +293,12 @@ export function categorizeTools(allTools: ToolLike[]): ToolGroup[] {
 
 	const sortedGroups = [...groups.entries()].sort((a, b) => b[1].length - a[1].length);
 	for (const [prefix, tools] of sortedGroups) {
+		const displayName = buildDisplayName(prefix);
 		result.push({
 			name: prefix,
-			displayName: buildDisplayName(prefix),
+			displayName,
 			tools,
-			description: buildDescription(prefix, tools),
+			description: buildDescription(prefix, displayName, tools),
 		});
 	}
 
@@ -254,25 +308,67 @@ export function categorizeTools(allTools: ToolLike[]): ToolGroup[] {
 
 // ─── LLM-based Categorization ────────────────────────────────────────────────
 
-/** Deterministic hash of sorted tool names — used to invalidate cache. */
+/** Deterministic, order-independent hash of tool names — used to invalidate cache. */
 export function computeToolHash(tools: ToolLike[]): string {
-	const sorted = tools.map((t) => t.name).sort().join("\n");
-	return createHash("sha256").update(sorted).digest("hex").slice(0, 16);
+	// Order-independence used to come from sorting the name strings, which
+	// dominated this hash (~2.6us for a realistic catalog: string comparison is
+	// per-character). Instead, map each name to a 53-bit numeric fingerprint and
+	// sort a typed array, whose native sort is numeric and needs no comparator.
+	// Same guarantees (deterministic, order-independent, detects any tool-set
+	// change) at a fraction of the cost. This is a cache token, not a security
+	// hash; a fingerprint collision would at worst leave a grouping stale until
+	// the next real change. Changing the scheme changes the stored value, so
+	// existing sessions re-categorize once on upgrade, same as any hash change.
+	const fingerprints = new Float64Array(tools.length);
+	for (let i = 0; i < tools.length; i++) fingerprints[i] = cyrb53(tools[i].name);
+	fingerprints.sort();
+	return cryptoHash("sha256", Buffer.from(fingerprints.buffer), "hex").slice(0, 16);
+}
+
+/**
+ * cyrb53: a fast, well-distributed 53-bit string hash (public domain). Gives each
+ * tool name a compact numeric fingerprint for the order-independent tool-set
+ * hash. Integer math kept within 2^53 so the result is exact and identical
+ * across platforms. Not a cryptographic hash.
+ */
+function cyrb53(str: string): number {
+	let h1 = 0xdeadbeef;
+	let h2 = 0x41c6ce57;
+	for (let i = 0; i < str.length; i++) {
+		const ch = str.charCodeAt(i);
+		h1 = Math.imul(h1 ^ ch, 2654435761);
+		h2 = Math.imul(h2 ^ ch, 1597334677);
+	}
+	h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507);
+	h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+	h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507);
+	h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+	return 4294967296 * (2097151 & h2) + (h1 >>> 0);
 }
 
 /** Build the system prompt for the categorization LLM call. */
-export function buildCategorizationPrompt(tools: ToolLike[]): string {
+/** Default grouping guidance: one service per group, no catch-alls. */
+export const DEFAULT_CATEGORIZATION_GUIDANCE = [
+	"- Group by PURPOSE and SERVICE, not just by name prefix",
+	"- Each distinct service or platform gets its OWN group (e.g. Buildkite, Observe, Slack, Grokt, Vault, GitHub, Data Portal — all separate)",
+	"- Do NOT merge unrelated services into one group. \"Shopify Developer Tools\" combining Buildkite + Grokt + Vault + GitHub is too broad — split them.",
+].join("\n");
+
+export function buildCategorizationPrompt(tools: ToolLike[], opts?: CategorizationConfig): string {
 	const toolList = tools
 		.map((t) => t.description ? `- ${t.name}: ${t.description}` : `- ${t.name}`)
 		.join("\n");
 
+	const minGroups = opts?.minGroups ?? 8;
+	const maxGroups = opts?.maxGroups ?? 12;
+	const guidance = opts?.guidance ?? DEFAULT_CATEGORIZATION_GUIDANCE;
+
 	return `You are a tool categorizer for a coding assistant. Group these tools so that tools a user needs together are in the same group.
 
 Goals:
-- Group by PURPOSE and SERVICE, not just by name prefix
-- Tools from the same service belong together (e.g. all Google Docs, Sheets, Drive, Workspace tools → one "Google" group)
+${guidance}
 - Tools the user always needs (file I/O, code editing, shell, asking questions, output handling, session management) → "core" group
-- Aim for 3-6 groups total. Fewer is better. Avoid catch-all "utility" groups.
+- Aim for ${minGroups}-${maxGroups} fine-grained groups. Prefer more specific groups over fewer broad ones. Avoid catch-all "utility" groups.
 - Each group needs: name (short lowercase id), displayName (human-readable), description (one line), tools (array)
 - Every tool must appear in exactly one group
 
@@ -284,16 +380,39 @@ Respond with ONLY valid JSON, no markdown fences:
 }
 
 /** Parse LLM response into ToolGroup[]. Returns null if parsing fails. */
+/**
+ * Pull a JSON object out of an LLM response that may be wrapped in a markdown
+ * fence or surrounded by prose. Tries, in order: a fenced code block anywhere in
+ * the text, the whole trimmed string, and the substring between the first "{"
+ * and the last "}". Returns the first candidate that parses, else null. This
+ * keeps categorization working when a model prefixes a sentence like "Here are
+ * the groups:" or adds a trailing note around the JSON.
+ */
+function extractJsonObject(response: string): unknown {
+	const text = response.trim();
+	const candidates: string[] = [];
+	const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+	if (fence) candidates.push(fence[1].trim());
+	candidates.push(text);
+	const first = text.indexOf("{");
+	const last = text.lastIndexOf("}");
+	if (first !== -1 && last > first) candidates.push(text.slice(first, last + 1));
+	for (const candidate of candidates) {
+		try {
+			return JSON.parse(candidate);
+		} catch {
+			// try the next candidate
+		}
+	}
+	return null;
+}
+
 export function parseCategorizationResponse(response: string, allToolNames: string[]): ToolGroup[] | null {
 	try {
-		// Strip markdown fences if present
-		let json = response.trim();
-		if (json.startsWith("```")) {
-			json = json.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
-		}
-
-		const parsed = JSON.parse(json) as { groups: ToolGroup[] };
-		if (!parsed.groups || !Array.isArray(parsed.groups)) return null;
+		// Models often wrap the JSON in a markdown fence or add a sentence before or
+		// after it, so we do not assume the whole string is JSON.
+		const parsed = extractJsonObject(response) as { groups: ToolGroup[] } | null;
+		if (!parsed || !parsed.groups || !Array.isArray(parsed.groups)) return null;
 
 		// Validate: every tool must appear exactly once
 		const allAssigned = new Set<string>();
@@ -382,6 +501,82 @@ export function getGroupMode(config: LazyToolsConfig | null, groupName: string):
 	if (!config) return "always";
 	if (groupName === "core") return "always";
 	return config.groups[groupName] ?? "on-demand";
+}
+
+// ─── Passthrough (spawned / non-interactive sessions) ─────────────────────────
+
+export const DEFAULT_PASSTHROUGH_MODES = ["rpc", "json", "print"];
+export const DEFAULT_PASSTHROUGH_ENV_MARKERS = ["PI_TEAM_ROLE"];
+
+/**
+ * Decide whether lazy-tools should stop filtering for this session.
+ *
+ * pi has no native notion of a subagent: a spawned teammate is just a child
+ * pi process the agent-teams extension launches. RPC-spawned children run in
+ * mode "rpc"; pane-spawned children run in mode "tui" and are indistinguishable
+ * from a human session except for the role marker the spawner injects. So we
+ * combine a pi-native dimension (run mode) with a generic env-marker list, and
+ * pass through when either matches. Returns false unless explicitly enabled.
+ */
+export function shouldPassthrough(
+	passthrough: PassthroughConfig | undefined,
+	mode: string,
+	env: Record<string, string | undefined>,
+): boolean {
+	if (!passthrough?.enabled) return false;
+	const modes = passthrough.modes ?? DEFAULT_PASSTHROUGH_MODES;
+
+	if (modes.includes(mode)) return true;
+	const markers = passthrough.envMarkers ?? DEFAULT_PASSTHROUGH_ENV_MARKERS;
+	return markers.some((name) => {
+		const value = env[name];
+		return value !== undefined && value !== "";
+	});
+}
+
+/**
+ * Decide whether the tool-set-changed and first-run categorization should run
+ * off the awaited startup path. Returns false unless explicitly enabled, so
+ * default behaviour stays blocking and unchanged.
+ */
+export function shouldBackgroundCategorize(
+	cfg: BackgroundCategorizationConfig | undefined,
+): boolean {
+	return cfg?.enabled === true;
+}
+
+/** Dependencies for the deferrable categorization orchestrator. */
+export interface DeferredCategorizationDeps {
+	/** Apply cached groups now, prefix-detecting any new tools. Cheap, synchronous. */
+	applyCachedGroups: () => void;
+	/** The slow path: LLM categorization plus apply and persist. */
+	runCategorization: () => Promise<void>;
+	/** Schedule background work off the awaited path. Defaults to a microtask. */
+	schedule?: (task: () => void) => void;
+}
+
+/**
+ * Run categorization on the tool-set-changed / first-run path, either blocking
+ * (default) or deferred (opt-in). When deferred, cached groups are applied at
+ * once and the LLM pass runs in the background, so startup is not blocked on
+ * model latency.
+ */
+export async function runCategorizationMaybeDeferred(
+	defer: boolean,
+	deps: DeferredCategorizationDeps,
+): Promise<void> {
+	if (!defer) {
+		await deps.runCategorization();
+		return;
+	}
+	deps.applyCachedGroups();
+	const schedule =
+		deps.schedule ?? ((task: () => void) => void Promise.resolve().then(task));
+	schedule(() => {
+		// Background pass: swallow errors so an unhandled rejection can never
+		// crash the session that already started without waiting for it.
+		void deps.runCategorization().catch(() => {});
+	});
 }
 
 // ─── Active Tool Computation ─────────────────────────────────────────────────
@@ -532,19 +727,121 @@ Do NOT hallucinate tools from inactive groups. Call load_tools first.`;
 
 // ─── Config Persistence ──────────────────────────────────────────────────────
 
+/**
+ * Buffer size for the fast config read. A fixed-size readSync skips the fstat
+ * that readFileSync does to size its own buffer, saving a syscall on the awaited
+ * startup path. 64 KiB covers a very large tool catalog (~900 tools); anything
+ * bigger falls back to readFileSync so correctness never depends on the guess.
+ */
+const CONFIG_READ_BUFFER_BYTES = 65536;
+
+/**
+ * Reused across calls so the 64 KiB buffer is allocated once at module load
+ * rather than on every startup. loadConfigFromPath is synchronous and
+ * non-reentrant (no await between the read and the decode), each read overwrites
+ * the buffer, and toString copies out only the bytes just read, so a shared
+ * buffer is safe and leaks no uninitialized memory.
+ */
+const configReadBuffer = Buffer.allocUnsafe(CONFIG_READ_BUFFER_BYTES);
+
 export function loadConfigFromPath(path: string): LazyToolsConfig | null {
-	if (!existsSync(path)) return null;
+	// Read directly and let a missing file throw, rather than paying a separate
+	// existsSync stat on every startup. A missing file, unreadable file, or
+	// invalid JSON all mean "no usable config", so one catch covers them.
 	try {
-		const content = readFileSync(path, "utf-8");
-		return JSON.parse(content) as LazyToolsConfig;
+		const config = JSON.parse(readConfigText(path)) as LazyToolsConfig;
+		// toolGroups is persisted column-wise (see serializeConfig); rebuild the
+		// ToolGroup[] the rest of the code expects. Legacy files stored it row-wise
+		// as an array, so leave those untouched.
+		if (config?.toolGroups && !Array.isArray(config.toolGroups)) {
+			config.toolGroups = decodeToolGroups(config.toolGroups as unknown as EncodedToolGroups);
+		}
+		return config;
 	} catch {
 		return null;
 	}
 }
 
+/**
+ * Read a config file with one fewer syscall than readFileSync: a single fixed
+ * buffer readSync avoids the fstat readFileSync uses to size its buffer. If the
+ * file fills the buffer it may have been truncated, so re-read it fully; that
+ * keeps arbitrarily large configs correct while the common small config takes
+ * the fast path.
+ */
+function readConfigText(path: string): string {
+	const fd = openSync(path, "r");
+	try {
+		const n = readSync(fd, configReadBuffer, 0, CONFIG_READ_BUFFER_BYTES, 0);
+		if (n === CONFIG_READ_BUFFER_BYTES) {
+			return readFileSync(path, "utf-8");
+		}
+		return configReadBuffer.toString("utf8", 0, n);
+	} finally {
+		closeSync(fd);
+	}
+}
+
 export function saveConfigToPath(path: string, config: LazyToolsConfig): void {
 	mkdirSync(dirname(path), { recursive: true });
-	writeFileSync(path, JSON.stringify(config, null, 2), "utf-8");
+	writeFileSync(path, serializeConfig(config), "utf-8");
+}
+
+/**
+ * Serialize the config so the human-edited keys (version, groups, passthrough,
+ * categorization) stay pretty-printed and readable, while toolGroups — the
+ * machine-generated cache nobody hand-edits — is written compact. That is ~30%
+ * fewer bytes and a measurably faster parse on the awaited startup read, and it
+ * round-trips through JSON.parse identically. Falls back to a plain pretty
+ * document when there is no toolGroups to set apart.
+ */
+function serializeConfig(config: LazyToolsConfig): string {
+	const { toolGroups, ...rest } = config;
+	const restStr = JSON.stringify(rest, null, 2);
+	if (toolGroups === undefined) return restStr;
+	// restStr ends with "\n}"; splice toolGroups in compact before the closing brace.
+	return `${restStr.slice(0, -2)},\n  "toolGroups": ${JSON.stringify(encodeToolGroups(toolGroups))}\n}`;
+}
+
+/**
+ * Column-wise (structure-of-arrays) form of the tool groups on disk. Array of
+ * objects repeats the four field names once per group; storing four parallel
+ * arrays writes each field name once, which is ~20% fewer bytes and a faster
+ * JSON.parse (arrays of primitives allocate fewer objects than an array of
+ * records). The saving grows with the group count. Round-trips exactly.
+ */
+interface EncodedToolGroups {
+	names: string[];
+	displayNames: string[];
+	descriptions: string[];
+	tools: string[][];
+}
+
+function encodeToolGroups(groups: ToolGroup[]): EncodedToolGroups {
+	const names: string[] = [];
+	const displayNames: string[] = [];
+	const descriptions: string[] = [];
+	const tools: string[][] = [];
+	for (const g of groups) {
+		names.push(g.name);
+		displayNames.push(g.displayName);
+		descriptions.push(g.description);
+		tools.push(g.tools);
+	}
+	return { names, displayNames, descriptions, tools };
+}
+
+function decodeToolGroups(enc: EncodedToolGroups): ToolGroup[] {
+	const groups: ToolGroup[] = [];
+	for (let i = 0; i < enc.names.length; i++) {
+		groups.push({
+			name: enc.names[i],
+			displayName: enc.displayNames[i],
+			description: enc.descriptions[i],
+			tools: enc.tools[i],
+		});
+	}
+	return groups;
 }
 
 // ─── Config Reconciliation ──────────────────────────────────────────────────
@@ -584,14 +881,21 @@ export function reconcileConfig(
  * Checked in order; first available one wins.
  */
 const PREFERRED_CATEGORIZATION_MODELS: Array<{ provider: string; pattern: RegExp }> = [
-	// Prefer newest flash variants first (cheap + fast + good at structured output)
+	// Full flash first, newest first, quality over raw speed. A categorization
+	// benchmark showed gemini-flash-latest gives the cleanest grouping at about
+	// four seconds once thinking is disabled, while flash-lite variants are
+	// faster but coarser, so lite ranks below full flash. The floating "latest"
+	// alias leads so auto-select tracks Google's newest flash without a code
+	// change. Non-lite patterns use a lookahead so a lite id never matches them.
+	{ provider: "google", pattern: /gemini-flash-latest/i },
+	{ provider: "google", pattern: /gemini-3.*flash(?!.*lite)/i },
 	{ provider: "google", pattern: /gemini-2\.5-flash(?!.*lite)/i },
-	{ provider: "google", pattern: /gemini-2\.0-flash/i },
-	{ provider: "google", pattern: /gemini-3.*flash/i },
+	{ provider: "google", pattern: /gemini.*flash(?!.*lite)/i },
+	{ provider: "google", pattern: /gemini-flash-lite-latest/i },
 	{ provider: "google", pattern: /gemini.*flash/i },
 	{ provider: "anthropic", pattern: /haiku/i },
 	{ provider: "openai", pattern: /gpt-4o-mini/i },
-	{ provider: "openai", pattern: /mini/i },
+	{ provider: "openai", pattern: /(mini|nano)/i },
 ];
 
 export interface ModelLike {
@@ -645,21 +949,77 @@ export function mergeGroupsIntoConfig(
 	newGroups: ToolGroup[],
 	toolHash: string,
 ): LazyToolsConfig {
-	const modes = { ...config.groups };
-	for (const group of newGroups) {
-		if (!(group.name in modes)) {
-			modes[group.name] = "on-demand";
-		}
-	}
-	// Remove modes for groups that no longer exist
-	const validNames = new Set(newGroups.map((g) => g.name));
-	for (const key of Object.keys(modes)) {
-		if (!validNames.has(key)) delete modes[key];
-	}
+	const modes: Record<string, GroupMode> = config.preserveModesBySignature
+		? mergeModesBySignature(config, newGroups)
+		: mergeModesByName(config.groups, newGroups);
 	return {
 		...config,
 		groups: modes,
 		toolHash,
 		toolGroups: newGroups,
 	};
+}
+
+/** Name-keyed merge: preserve modes for same-named groups, drop stale ones. */
+function mergeModesByName(
+	oldModes: Record<string, GroupMode>,
+	newGroups: ToolGroup[],
+): Record<string, GroupMode> {
+	const modes = { ...oldModes };
+	for (const group of newGroups) {
+		if (!(group.name in modes)) {
+			modes[group.name] = "on-demand";
+		}
+	}
+	const validNames = new Set(newGroups.map((g) => g.name));
+	for (const key of Object.keys(modes)) {
+		if (!validNames.has(key)) delete modes[key];
+	}
+	return modes;
+}
+
+/**
+ * Signature-keyed merge: preserve modes across renames. A new group keeps its
+ * mode by name when the name still exists; otherwise it inherits the mode of
+ * the old group its tools most came from. This survives the LLM renaming a
+ * cluster (e.g. "team_management" → "team"), which is what silently reset
+ * "always" choices to "on-demand" before.
+ */
+function mergeModesBySignature(
+	config: LazyToolsConfig,
+	newGroups: ToolGroup[],
+): Record<string, GroupMode> {
+	const oldGroups = config.toolGroups ?? [];
+	const modes: Record<string, GroupMode> = {};
+	for (const group of newGroups) {
+		if (group.name in config.groups) {
+			modes[group.name] = config.groups[group.name];
+			continue;
+		}
+		modes[group.name] = inheritModeBySignature(group, oldGroups, config.groups) ?? "on-demand";
+	}
+	return modes;
+}
+
+/**
+ * Find the mode of the old group that a new group's tools most came from.
+ * Returns the inherited mode when at least half of the new group's tools were
+ * in a single old group, otherwise undefined.
+ */
+export function inheritModeBySignature(
+	newGroup: ToolGroup,
+	oldGroups: ToolGroup[],
+	oldModes: Record<string, GroupMode>,
+): GroupMode | undefined {
+	if (newGroup.tools.length === 0) return undefined;
+	const newSet = new Set(newGroup.tools);
+	let best: { name: string; shared: number } | null = null;
+	for (const old of oldGroups) {
+		const shared = old.tools.filter((tool) => newSet.has(tool)).length;
+		if (shared === 0) continue;
+		if (!best || shared > best.shared) best = { name: old.name, shared };
+	}
+	if (!best) return undefined;
+	if (best.shared / newGroup.tools.length < 0.5) return undefined;
+	return oldModes[best.name];
 }

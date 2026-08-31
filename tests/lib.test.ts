@@ -23,6 +23,10 @@ import {
 	mergeGroupsIntoConfig,
 	autoSelectCategorizationModel,
 	GroupIndex,
+	shouldPassthrough,
+	shouldBackgroundCategorize,
+	runCategorizationMaybeDeferred,
+	inheritModeBySignature,
 	type ToolLike,
 	type ToolGroup,
 	type LazyToolsConfig,
@@ -883,6 +887,24 @@ describe("LLM categorization helpers", () => {
 		assert.ok(result);
 	});
 
+	it("parseCategorizationResponse handles a prose preamble before a fenced block", () => {
+		const response = "Here are the tool groups:\n\n```json\n" + JSON.stringify({
+			groups: [{ name: "core", displayName: "Core", description: "Core", tools: ["read"] }],
+		}) + "\n```\n\nLet me know if you want changes.";
+		const result = parseCategorizationResponse(response, ["read"]);
+		assert.ok(result, "should parse JSON wrapped in prose and a fence");
+		assert.ok(result!.find(g => g.name === "core"));
+	});
+
+	it("parseCategorizationResponse handles prose around a raw (unfenced) object", () => {
+		const response = "Sure! " + JSON.stringify({
+			groups: [{ name: "core", displayName: "Core", description: "Core", tools: ["read"] }],
+		}) + " Hope that helps.";
+		const result = parseCategorizationResponse(response, ["read"]);
+		assert.ok(result, "should slice the outermost braces out of surrounding prose");
+		assert.ok(result!.find(g => g.name === "core"));
+	});
+
 	it("parseCategorizationResponse returns null for garbage", () => {
 		assert.equal(parseCategorizationResponse("not json at all", ["read"]), null);
 	});
@@ -910,12 +932,29 @@ describe("autoSelectCategorizationModel", () => {
 		assert.equal(autoSelectCategorizationModel(models), "google/gemini-2.5-flash");
 	});
 
-	it("prefers 2.0-flash over 1.5-flash", () => {
+	it("prefers the flash-latest alias over numbered flash", () => {
 		const models: ModelLike[] = [
-			{ provider: "google", id: "gemini-1.5-flash" },
-			{ provider: "google", id: "gemini-2.0-flash" },
+			{ provider: "google", id: "gemini-2.5-flash" },
+			{ provider: "google", id: "gemini-3.5-flash" },
+			{ provider: "google", id: "gemini-flash-latest" },
 		];
-		assert.equal(autoSelectCategorizationModel(models), "google/gemini-2.0-flash");
+		assert.equal(autoSelectCategorizationModel(models), "google/gemini-flash-latest");
+	});
+
+	it("prefers gemini-3 flash over gemini-2.5 flash", () => {
+		const models: ModelLike[] = [
+			{ provider: "google", id: "gemini-2.5-flash" },
+			{ provider: "google", id: "gemini-3.5-flash" },
+		];
+		assert.equal(autoSelectCategorizationModel(models), "google/gemini-3.5-flash");
+	});
+
+	it("prefers full flash over the lite alias", () => {
+		const models: ModelLike[] = [
+			{ provider: "google", id: "gemini-flash-lite-latest" },
+			{ provider: "google", id: "gemini-2.5-flash" },
+		];
+		assert.equal(autoSelectCategorizationModel(models), "google/gemini-2.5-flash");
 	});
 
 	it("skips flash-lite for 2.5", () => {
@@ -959,5 +998,233 @@ describe("autoSelectCategorizationModel", () => {
 			{ provider: "google", id: "gemini-2.5-flash-preview-04-17" },
 		];
 		assert.equal(autoSelectCategorizationModel(models), "google/gemini-2.5-flash-preview-04-17");
+	});
+});
+
+// ─── shouldPassthrough ────────────────────────────────────────────────
+
+describe("shouldPassthrough", () => {
+	it("returns false when passthrough is undefined", () => {
+		assert.equal(shouldPassthrough(undefined, "rpc", {}), false);
+	});
+
+	it("returns false when not enabled, even if a mode matches", () => {
+		assert.equal(shouldPassthrough({ enabled: false }, "rpc", {}), false);
+		assert.equal(shouldPassthrough({ modes: ["rpc"] }, "rpc", {}), false);
+	});
+
+	it("passes through on a default non-interactive mode", () => {
+		assert.equal(shouldPassthrough({ enabled: true }, "rpc", {}), true);
+		assert.equal(shouldPassthrough({ enabled: true }, "json", {}), true);
+		assert.equal(shouldPassthrough({ enabled: true }, "print", {}), true);
+	});
+
+	it("does NOT pass through on interactive tui by mode alone", () => {
+		assert.equal(shouldPassthrough({ enabled: true }, "tui", {}), false);
+	});
+
+	it("passes through a pane teammate (tui) via the env marker", () => {
+		assert.equal(shouldPassthrough({ enabled: true }, "tui", { PI_TEAM_ROLE: "teammate" }), true);
+	});
+
+	it("treats an empty env marker value as absent", () => {
+		assert.equal(shouldPassthrough({ enabled: true }, "tui", { PI_TEAM_ROLE: "" }), false);
+	});
+
+	it("honours custom modes", () => {
+		assert.equal(shouldPassthrough({ enabled: true, modes: ["tui"] }, "tui", {}), true);
+		assert.equal(shouldPassthrough({ enabled: true, modes: ["tui"] }, "rpc", {}), false);
+	});
+
+	it("honours custom env markers", () => {
+		const cfg = { enabled: true, modes: [] as string[], envMarkers: ["PI_SUBAGENT"] };
+		assert.equal(shouldPassthrough(cfg, "tui", { PI_SUBAGENT: "1" }), true);
+		assert.equal(shouldPassthrough(cfg, "tui", { PI_TEAM_ROLE: "teammate" }), false);
+	});
+});
+
+// ─── shouldBackgroundCategorize ────────────────────────────────────────
+
+describe("shouldBackgroundCategorize", () => {
+	it("returns false when the config is undefined", () => {
+		assert.equal(shouldBackgroundCategorize(undefined), false);
+	});
+
+	it("returns false when enabled is absent or false", () => {
+		assert.equal(shouldBackgroundCategorize({}), false);
+		assert.equal(shouldBackgroundCategorize({ enabled: false }), false);
+	});
+
+	it("returns true only when enabled is exactly true", () => {
+		assert.equal(shouldBackgroundCategorize({ enabled: true }), true);
+	});
+});
+
+// ─── runCategorizationMaybeDeferred ──────────────────────────────────
+
+describe("runCategorizationMaybeDeferred", () => {
+	it("blocking: awaits runCategorization and does not apply cached groups", async () => {
+		const order: string[] = [];
+		let resolved = false;
+		await runCategorizationMaybeDeferred(false, {
+			applyCachedGroups: () => order.push("cached"),
+			runCategorization: async () => {
+				order.push("llm-start");
+				await Promise.resolve();
+				resolved = true;
+				order.push("llm-done");
+			},
+		});
+		// The await returned only after runCategorization fully resolved.
+		assert.equal(resolved, true);
+		assert.deepEqual(order, ["llm-start", "llm-done"]);
+	});
+
+	it("deferred: applies cached groups synchronously and returns before the LLM resolves", async () => {
+		const order: string[] = [];
+		let llmDone = false;
+		let release!: () => void;
+		const gate = new Promise<void>((r) => { release = r; });
+		const scheduled: Array<() => void> = [];
+		await runCategorizationMaybeDeferred(true, {
+			applyCachedGroups: () => order.push("cached"),
+			runCategorization: async () => {
+				order.push("llm-start");
+				await gate;
+				llmDone = true;
+				order.push("llm-done");
+			},
+			schedule: (task) => { scheduled.push(task); },
+		});
+		// Returned already: cached applied, LLM not started, not done.
+		assert.deepEqual(order, ["cached"]);
+		assert.equal(llmDone, false);
+		assert.equal(scheduled.length, 1);
+		// Drain the scheduled background work.
+		scheduled[0]!();
+		release();
+		await gate;
+		await Promise.resolve();
+		assert.equal(llmDone, true);
+		assert.deepEqual(order, ["cached", "llm-start", "llm-done"]);
+	});
+
+	it("deferred: a rejecting background categorization does not throw to the caller", async () => {
+		const scheduled: Array<() => void> = [];
+		await runCategorizationMaybeDeferred(true, {
+			applyCachedGroups: () => {},
+			runCategorization: async () => { throw new Error("llm boom"); },
+			schedule: (task) => { scheduled.push(task); },
+		});
+		// Draining the background task must not throw synchronously.
+		assert.doesNotThrow(() => scheduled[0]!());
+		await Promise.resolve();
+	});
+
+	it("deferred: returns without awaiting completion using the default scheduler", async () => {
+		let done = false;
+		let release!: () => void;
+		const gate = new Promise<void>((r) => { release = r; });
+		await runCategorizationMaybeDeferred(true, {
+			applyCachedGroups: () => {},
+			runCategorization: async () => { await gate; done = true; },
+		});
+		// Returned even though the background pass is still blocked on the gate.
+		assert.equal(done, false);
+		release();
+		await gate;
+		await Promise.resolve();
+		assert.equal(done, true, "background work completes once unblocked");
+	});
+});
+
+// ─── buildCategorizationPrompt (config-driven) ─────────────────────────────
+
+describe("buildCategorizationPrompt group-count tuning", () => {
+	it("defaults to an 8-12 group target", () => {
+		const prompt = buildCategorizationPrompt([{ name: "read" }]);
+		assert.ok(prompt.includes("8-12"), "default target should be 8-12");
+	});
+
+	it("respects a custom min/max group range", () => {
+		const prompt = buildCategorizationPrompt([{ name: "read" }], { minGroups: 3, maxGroups: 6 });
+		assert.ok(prompt.includes("3-6"));
+		assert.ok(!prompt.includes("8-12"));
+	});
+
+	it("uses custom guidance when provided", () => {
+		const prompt = buildCategorizationPrompt([{ name: "read" }], { guidance: "- KEEP IT SIMPLE" });
+		assert.ok(prompt.includes("KEEP IT SIMPLE"));
+		assert.ok(!prompt.includes("Buildkite"), "default guidance should be replaced");
+	});
+});
+
+// ─── signature-based mode preservation ───────────────────────────────────
+
+describe("inheritModeBySignature", () => {
+	const oldGroups: ToolGroup[] = [
+		{ name: "team_management", displayName: "Team", description: "", tools: ["team_a", "team_b", "team_c"] },
+		{ name: "web", displayName: "Web", description: "", tools: ["web_search", "web_fetch"] },
+	];
+	const oldModes: Record<string, GroupMode> = { team_management: "always", web: "on-demand" };
+
+	it("inherits mode for an identical (renamed) group", () => {
+		const renamed: ToolGroup = { name: "team", displayName: "Team", description: "", tools: ["team_a", "team_b", "team_c"] };
+		assert.equal(inheritModeBySignature(renamed, oldGroups, oldModes), "always");
+	});
+
+	it("inherits mode for a subset split of an old group", () => {
+		const split: ToolGroup = { name: "team_comms", displayName: "Comms", description: "", tools: ["team_a", "team_b"] };
+		assert.equal(inheritModeBySignature(split, oldGroups, oldModes), "always");
+	});
+
+	it("returns undefined when overlap is below half", () => {
+		const weak: ToolGroup = { name: "misc", displayName: "Misc", description: "", tools: ["team_a", "x", "y", "z"] };
+		assert.equal(inheritModeBySignature(weak, oldGroups, oldModes), undefined);
+	});
+
+	it("returns undefined with no overlap or no tools", () => {
+		const none: ToolGroup = { name: "n", displayName: "N", description: "", tools: ["other"] };
+		assert.equal(inheritModeBySignature(none, oldGroups, oldModes), undefined);
+		const empty: ToolGroup = { name: "e", displayName: "E", description: "", tools: [] };
+		assert.equal(inheritModeBySignature(empty, oldGroups, oldModes), undefined);
+	});
+});
+
+describe("mergeGroupsIntoConfig signature preservation", () => {
+	const oldConfig = (extra: Partial<LazyToolsConfig> = {}): LazyToolsConfig => ({
+		version: 1,
+		groups: { core: "always", team_management: "always", web: "on-demand" },
+		toolGroups: [
+			{ name: "core", displayName: "Core", description: "", tools: ["read", "load_tools"] },
+			{ name: "team_management", displayName: "Team", description: "", tools: ["team_a", "team_b", "team_c"] },
+			{ name: "web", displayName: "Web", description: "", tools: ["web_search", "web_fetch"] },
+		],
+		...extra,
+	});
+
+	// The LLM renamed team_management -> team on re-categorization.
+	const renamedGroups: ToolGroup[] = [
+		{ name: "core", displayName: "Core", description: "", tools: ["read", "load_tools"] },
+		{ name: "team", displayName: "Team", description: "", tools: ["team_a", "team_b", "team_c"] },
+		{ name: "web", displayName: "Web", description: "", tools: ["web_search", "web_fetch"] },
+	];
+
+	it("loses the always mode on rename when signature keying is off (documents the bug)", () => {
+		const merged = mergeGroupsIntoConfig(oldConfig(), renamedGroups, "hash2");
+		assert.equal(merged.groups.team, "on-demand");
+		assert.ok(!("team_management" in merged.groups), "stale name pruned");
+	});
+
+	it("preserves the always mode across a rename when signature keying is on", () => {
+		const merged = mergeGroupsIntoConfig(oldConfig({ preserveModesBySignature: true }), renamedGroups, "hash2");
+		assert.equal(merged.groups.team, "always", "renamed team cluster keeps always");
+		assert.equal(merged.groups.web, "on-demand");
+	});
+
+	it("keeps mode by exact name even with signature keying on", () => {
+		const sameGroups: ToolGroup[] = oldConfig().toolGroups!;
+		const merged = mergeGroupsIntoConfig(oldConfig({ preserveModesBySignature: true }), sameGroups, "hash2");
+		assert.equal(merged.groups.team_management, "always");
 	});
 });

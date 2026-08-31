@@ -18,11 +18,11 @@
  */
 
 import { join } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { DynamicBorder, getAgentDir, getSettingsListTheme } from "@mariozechner/pi-coding-agent";
-import { Container, Key, type SelectItem, SelectList, type SettingItem, SettingsList, Text } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
-import { completeSimple } from "@mariozechner/pi-ai";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { Container, Key, type SelectItem, SelectList, type SettingItem, SettingsList, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
+import { completeSimple } from "@earendil-works/pi-ai";
 import {
 	type GroupMode,
 	type LazyToolsConfig,
@@ -44,6 +44,9 @@ import {
 	parseCategorizationResponse,
 	mergeGroupsIntoConfig,
 	autoSelectCategorizationModel,
+	shouldPassthrough,
+	shouldBackgroundCategorize,
+	runCategorizationMaybeDeferred,
 } from "../lib/lib.js";
 
 function getConfigPath(): string {
@@ -120,12 +123,28 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 	}
 
 	/**
+	 * Extra request params that disable hidden thinking for google models.
+	 * gemini flash otherwise spends thousands of reasoning tokens on these small
+	 * structured-JSON calls, which is slow and can truncate the JSON. The
+	 * reasoning_effort lever is a no-op for google through the proxy (its
+	 * thinkingLevelMap.off is null), so we pass the LiteLLM extra_body that reaches
+	 * the model with a zero thinking budget. Only openai-compatible adapters read
+	 * samplingParams; native backends and non-google models ignore it, so this is
+	 * safe to pass unconditionally.
+	 */
+	function thinkingOffParams(model: any): Record<string, unknown> | undefined {
+		return model?.provider === "google"
+			? { extra_body: { google: { thinking_config: { thinking_budget: 0 } } } }
+			: undefined;
+	}
+
+	/**
 	 * Run LLM categorization with a specific model.
 	 * Returns the parsed groups or null on failure.
 	 */
 	async function categorizationWithModel(model: any, ctx: ExtensionContext): Promise<ToolGroup[] | null> {
 		const allTools = pi.getAllTools();
-		const prompt = buildCategorizationPrompt(allTools);
+		const prompt = buildCategorizationPrompt(allTools, config?.categorization);
 		const allToolNames = allTools.map((t) => t.name);
 		debugLog(`categorizationWithModel: model=${model?.provider}/${model?.id} toolCount=${allTools.length} toolNames=${allToolNames.join(",")}`);
 
@@ -142,7 +161,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 						timestamp: Date.now(),
 					}],
 				},
-				{ maxTokens: 4096, apiKey, headers },
+				{ maxTokens: 8192, apiKey, headers, samplingParams: thinkingOffParams(model) },
 			);
 
 			const text = response.content
@@ -267,7 +286,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 						timestamp: Date.now(),
 					}],
 				},
-				{ maxTokens: 256, apiKey, headers },
+				{ maxTokens: 256, apiKey, headers, samplingParams: thinkingOffParams(model) },
 			);
 			const text = response.content
 				.filter((c: any) => c.type === "text")
@@ -421,11 +440,19 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 		if (opts?.showModePicker === false) return true;
 
 		// Enter/Space cycles mode. SettingsList handles everything natively.
-		const items: SettingItem[] = toolGroups.map((group) => {
+		// Pad every label to a uniform width so the mode column lines up. pi-tui's
+		// SettingsList caps its own label padding at 30 columns, so a label longer
+		// than that would get no padding and push its value out of alignment; giving
+		// every label the same width makes that cap a no-op and keeps the columns
+		// aligned regardless of the longest group name.
+		const rawLabels = toolGroups.map((group) => `${group.displayName} (${group.tools.length} tools)`);
+		const labelWidth = Math.max(0, ...rawLabels.map((l) => visibleWidth(l)));
+		const items: SettingItem[] = toolGroups.map((group, i) => {
 			const isCore = group.name === "core";
+			const label = rawLabels[i] + " ".repeat(Math.max(0, labelWidth - visibleWidth(rawLabels[i])));
 			return {
 				id: group.name,
-				label: `${group.displayName} (${group.tools.length} tools)`,
+				label,
 				description: group.tools.join(", "),
 				currentValue: isCore ? "always" : (config?.groups[group.name] ?? "on-demand"),
 				values: isCore ? ["always"] : ["always", "on-demand", "off"],
@@ -445,14 +472,14 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 			container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
 			container.addChild(
 				new (class {
-					render(_width: number) {
+					render(width: number) {
 						return [
 							" " + theme.fg("accent", theme.bold("⚡ Lazy Tools Setup")),
 							"",
 							" " + theme.fg("dim", "Configure which tool groups load at startup vs on-demand."),
 							" " + theme.fg("dim", "Enter/Space to cycle mode. Esc to save & close."),
 							"",
-						];
+						].map((line) => truncateToWidth(line, width));
 					}
 					invalidate() {}
 				})(),
@@ -480,11 +507,11 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 
 			container.addChild(
 				new (class {
-					render(_width: number) {
+					render(width: number) {
 						return [
 							"",
 							" " + theme.fg("dim", "enter/space cycle mode • ↑↓ navigate • type to search • esc save & close"),
-						];
+						].map((line) => truncateToWidth(line, width));
 					}
 					invalidate() {}
 				})(),
@@ -607,8 +634,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 	pi.registerCommand("tools-status", {
 		description: "Show current tool group status",
 		handler: async (_args, ctx) => {
-			const lines: string[] = [];
-			for (const group of toolGroups) {
+			const rows = toolGroups.map((group) => {
 				const mode = getGroupMode(config, group.name);
 				const loaded = sessionActivated.has(group.name);
 				const icon = mode === "always" || loaded ? "●" : mode === "on-demand" ? "○" : "✕";
@@ -619,8 +645,14 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 						: mode === "on-demand"
 							? "on-demand"
 							: "off";
-				lines.push(`${icon} ${group.displayName} (${group.tools.length}) — ${status}`);
-			}
+				return { icon, label: `${group.displayName} (${group.tools.length})`, status };
+			});
+			// Pad the label to a uniform width so the status column lines up.
+			const statusLabelWidth = Math.max(0, ...rows.map((r) => visibleWidth(r.label)));
+			const lines = rows.map((r) => {
+				const padded = r.label + " ".repeat(Math.max(0, statusLabelWidth - visibleWidth(r.label)));
+				return `${r.icon} ${padded} — ${r.status}`;
+			});
 			ctx.ui.notify(lines.join("\n"), "info");
 		},
 	});
@@ -715,7 +747,19 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 
 		// Load config
 		config = loadConfigFromPath(getConfigPath());
-		debugLog(`session_start: reason=${event.reason} hasUI=${ctx.hasUI} configLoaded=${config !== null} configPath=${getConfigPath()}`);
+		debugLog(`session_start: reason=${event.reason} hasUI=${ctx.hasUI} mode=${ctx.mode} configLoaded=${config !== null} configPath=${getConfigPath()}`);
+
+		// Passthrough: in spawned agents (e.g. team teammates/subagents) and
+		// non-interactive modes, get out of the way entirely. A teammate is a
+		// child pi process reading this same config file; filtering its tools
+		// here strips the team_message/team_shutdown tools it needs to report
+		// back and shut down. Opt-in via config; off by default.
+		if (shouldPassthrough(config?.passthrough, ctx.mode, process.env)) {
+			isEnabled = false;
+			ctx.ui.setStatus("lazy-tools", undefined);
+			debugLog(`session_start: passthrough active (mode=${ctx.mode}) — lazy filtering disabled, all tools remain active`);
+			return;
+		}
 
 		// Restore session-activated groups from branch
 		const entries = ctx.sessionManager.getBranch();
@@ -740,26 +784,18 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 				toolGroups = config.toolGroups;
 				rebuildIndex();
 			} else if (config.toolHash !== currentHash) {
-				// ── Tools changed: re-categorize silently ──
+				// ── Tools changed: re-categorize ──
 				const previousGroupNames = new Set(Object.keys(config.groups));
-				const reran = await runLlmCategorization(ctx);
-				if (reran) {
-					// mergeGroupsIntoConfig preserves existing mode preferences.
-					// Only show wizard if there are genuinely NEW groups the user
-					// hasn't configured yet.
-					const newGroupNames = Object.keys(config!.groups);
-					const hasNewGroups = newGroupNames.some(g => !previousGroupNames.has(g));
-					if (hasNewGroups && ctx.hasUI) {
-						await runSetupWizard(ctx);
-					}
-					saveConfigToPath(getConfigPath(), config!);
-				} else {
-					// LLM failed — fall back to existing groups + prefix detection
-					// for any new tools. Do NOT wipe config or show wizard.
-					if (config.toolGroups) {
-						toolGroups = config.toolGroups;
+				const defer = shouldBackgroundCategorize(config.backgroundCategorization);
+
+				// Apply the previous groups now, prefix-detecting any new tools.
+				// This is the immediate, cheap grouping used both as the deferred
+				// startup grouping and as the blocking-path fallback when the LLM
+				// pass fails. Behaviour is identical to the prior inline fallback.
+				const applyCachedGroups = () => {
+					if (config!.toolGroups) {
+						toolGroups = config!.toolGroups;
 						rebuildIndex();
-						// Merge new tools via prefix detection
 						const allTools = pi.getAllTools();
 						const known = new Set(toolGroups.flatMap(g => g.tools));
 						const newTools = allTools.filter(t => !known.has(t.name));
@@ -771,18 +807,50 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 									existing.tools.push(...ng.tools);
 								} else {
 									toolGroups.push(ng);
-									config.groups[ng.name] = "on-demand";
+									config!.groups[ng.name] = "on-demand";
 								}
 							}
 							rebuildIndex();
 						}
-						ctx.ui.notify("lazy-tools: tool set changed, using previous groups. Run /tools-setup to reconfigure.", "info");
 					} else {
 						// No saved groups at all — prefix-detect everything
 						toolGroups = categorizeTools(pi.getAllTools());
 						rebuildIndex();
 					}
-				}
+				};
+
+				const runCategorization = async () => {
+					const reran = await runLlmCategorization(ctx);
+					if (reran) {
+						// mergeGroupsIntoConfig preserves existing mode preferences.
+						// Only show wizard if there are genuinely NEW groups the user
+						// hasn't configured yet. Skip the interactive wizard when
+						// deferred: a background pass must not seize the UI after the
+						// session has already started; the status line signals the swap.
+						const newGroupNames = Object.keys(config!.groups);
+						const hasNewGroups = newGroupNames.some(g => !previousGroupNames.has(g));
+						if (hasNewGroups && ctx.hasUI && !defer) {
+							await runSetupWizard(ctx);
+						}
+						saveConfigToPath(getConfigPath(), config!);
+					} else if (!defer) {
+						// Blocking path, LLM failed: fall back to previous groups +
+						// prefix detection and tell the user.
+						applyCachedGroups();
+						ctx.ui.notify("lazy-tools: tool set changed, using previous groups. Run /tools-setup to reconfigure.", "info");
+					}
+					// Deferred: cached groups were applied up front and the session
+					// already started, so swap in whatever the pass produced.
+					if (defer) {
+						applyActiveTools();
+						updateStatus(ctx);
+					}
+				};
+
+				await runCategorizationMaybeDeferred(defer, {
+					applyCachedGroups,
+					runCategorization,
+				});
 			}
 		}
 
